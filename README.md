@@ -6,6 +6,8 @@
 
 Professional duplicate file finder with a progressive hashing pipeline for terabyte-scale scanning. PowerShell WPF with Catppuccin Mocha dark theme.
 
+![DuplicateFF Screenshot](screenshot.png)
+
 ## Features
 
 - **Progressive Hashing Pipeline** - 5-stage elimination (size grouping, prefix hash, suffix hash, full SHA256) minimizes disk I/O
