@@ -1,9 +1,34 @@
-# DuplicateFF v1.0.0 - Professional Duplicate File Finder
+# DuplicateFF v1.1.0 - Professional Duplicate File Finder
 # PowerShell WPF | Catppuccin Mocha | Progressive Hashing Pipeline
 # MIT License - github.com/SysAdminDoc/DuplicateFF
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, Microsoft.VisualBasic
-Add-Type -AssemblyName System.Drawing
+# --- CLI Parameters ---
+param(
+    [string[]]$Scan,
+    [string[]]$Reference,
+    [ValidateSet('All','Images','Videos','Audio','Documents')]
+    [string]$Filter = 'All',
+    [ValidateSet('KeepNewest','KeepOldest','KeepReference','KeepLargest','KeepShortestPath')]
+    [string]$AutoSelect,
+    [ValidateSet('RecycleBin','Permanent','Hardlink')]
+    [string]$Delete,
+    [switch]$Json,
+    [switch]$DryRun,
+    [switch]$Silent,
+    [string]$ReportPath,
+    [string]$MinSize = 'No Minimum',
+    [switch]$NoSubfolders,
+    [switch]$IncludeZeroByte
+)
+
+$script:CLIMode = $Scan.Count -gt 0
+
+if (-not $script:CLIMode) {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, Microsoft.VisualBasic
+    Add-Type -AssemblyName System.Drawing
+} else {
+    Add-Type -AssemblyName Microsoft.VisualBasic
+}
 
 # --- P/Invoke for console hiding ---
 Add-Type -TypeDefinition @"
@@ -12,9 +37,18 @@ using System.Runtime.InteropServices;
 public class Win32 {
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
 }
 "@
-[Win32]::ShowWindow([Win32]::GetConsoleWindow(), 0) | Out-Null
+if (-not $script:CLIMode) {
+    [Win32]::ShowWindow([Win32]::GetConsoleWindow(), 0) | Out-Null
+}
+
+# ===================================================================
+# GUI MODE
+# ===================================================================
+if (-not $script:CLIMode) {
 
 # --- Catppuccin Mocha Palette ---
 $script:Colors = @{
@@ -31,8 +65,9 @@ $script:Colors = @{
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DuplicateFF v1.0.0" Width="1280" Height="820" MinWidth="900" MinHeight="650"
-        WindowStartupLocation="CenterScreen" Background="$($Colors.Base)">
+        Title="DuplicateFF v1.1.0" Width="1280" Height="820" MinWidth="900" MinHeight="650"
+        WindowStartupLocation="CenterScreen" Background="$($Colors.Base)"
+        AllowDrop="True">
     <Window.Resources>
         <Style x:Key="BtnStyle" TargetType="Button">
             <Setter Property="Background" Value="$($Colors.Surface0)"/>
@@ -436,6 +471,9 @@ $script:Colors = @{
                             <ComboBoxItem Content="Permanent Delete"/>
                             <ComboBoxItem Content="Replace with Hardlinks"/>
                         </ComboBox>
+                        <Button x:Name="btnRehearse" Content="Rehearse Delete (Preview)" Style="{StaticResource BtnStyle}"
+                                HorizontalAlignment="Stretch" Margin="0,0,0,4"
+                                ToolTip="Preview exactly what would be deleted without actually deleting anything"/>
                         <Button x:Name="btnDeleteSelected" Content="Delete Selected" Style="{StaticResource DangerBtn}"
                                 HorizontalAlignment="Stretch" Margin="0,0,0,4"/>
                         <Button x:Name="btnExport" Content="Export Results (CSV)" Style="{StaticResource BtnStyle}"
@@ -475,7 +513,7 @@ $controls = @{}
 @('lstFolders','btnAddFolder','btnAddRef','btnRemoveFolder','cmbMinSize','cmbFilter',
   'chkSubfolders','chkZeroByte','btnScan','btnCancel','dgResults','imgPreview',
   'txtPreviewName','txtPreviewInfo','cmbAutoSelect','btnAutoSelect','btnSelectAll',
-  'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnDeleteSelected','btnExport',
+  'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnRehearse','btnDeleteSelected','btnExport',
   'txtStatus','txtStats','prgScan') | ForEach-Object {
     $controls[$_] = $window.FindName($_)
 }
@@ -561,6 +599,22 @@ function Remove-ToRecycleBin([string]$path) {
     )
 }
 
+# --- Helper: Get volume root for cross-volume hardlink guard ---
+function Get-VolumeRoot([string]$path) {
+    [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
+}
+
+# --- Helper: Test if file is locked ---
+function Test-FileLocked([string]$path) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+        $fs.Dispose()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
 # --- Add Folder ---
 $controls.btnAddFolder.Add_Click({
     $dlg = [System.Windows.Forms.FolderBrowserDialog]@{
@@ -600,6 +654,34 @@ $controls.btnRemoveFolder.Add_Click({
         $script:ScanFolders.RemoveAt($idx)
         $controls.lstFolders.Items.RemoveAt($idx)
     }
+})
+
+# --- Drag-and-Drop Folders ---
+$window.Add_Drop({
+    param($sender, $e)
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+        $paths = $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
+        foreach ($p in $paths) {
+            if ([System.IO.Directory]::Exists($p)) {
+                $existing = $script:ScanFolders | Where-Object { $_.Path -eq $p }
+                if (-not $existing) {
+                    $entry = [PSCustomObject]@{ Path = $p; IsReference = $false }
+                    $script:ScanFolders.Add($entry)
+                    $controls.lstFolders.Items.Add($p) | Out-Null
+                }
+            }
+        }
+        $controls.txtStatus.Text = "$($script:ScanFolders.Count) folders ready to scan"
+    }
+})
+$window.Add_DragOver({
+    param($sender, $e)
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+        $e.Effects = [System.Windows.DragDropEffects]::Link
+    } else {
+        $e.Effects = [System.Windows.DragDropEffects]::None
+    }
+    $e.Handled = $true
 })
 
 # --- Preview on Selection ---
@@ -741,6 +823,31 @@ $controls.btnScan.Add_Click({
             } catch { return $null }
         }
 
+        # Byte-compare fallback: streams both files and exits on first mismatch
+        function Test-ByteIdentical([string]$pathA, [string]$pathB) {
+            try {
+                $fsA = [System.IO.File]::Open($pathA, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $fsB = [System.IO.File]::Open($pathB, 'Open', 'Read', 'ReadWrite')
+                    try {
+                        if ($fsA.Length -ne $fsB.Length) { return $false }
+                        $bufSize = 65536
+                        $bufA = [byte[]]::new($bufSize)
+                        $bufB = [byte[]]::new($bufSize)
+                        while ($true) {
+                            $readA = $fsA.Read($bufA, 0, $bufSize)
+                            $readB = $fsB.Read($bufB, 0, $bufSize)
+                            if ($readA -ne $readB) { return $false }
+                            if ($readA -eq 0) { return $true }
+                            for ($i = 0; $i -lt $readA; $i++) {
+                                if ($bufA[$i] -ne $bufB[$i]) { return $false }
+                            }
+                        }
+                    } finally { $fsB.Dispose() }
+                } finally { $fsA.Dispose() }
+            } catch { return $false }
+        }
+
         try {
             $minSize = Get-MinSizeBytes $minSizeLabel
 
@@ -755,9 +862,18 @@ $controls.btnScan.Add_Click({
                 if ($f.IsReference) { $refPaths.Add($f.Path) | Out-Null }
             }
 
+            # Reference-folder integrity guard: abort if any reference folder is inaccessible
+            foreach ($rp in $refPaths) {
+                if (-not [System.IO.Directory]::Exists($rp)) {
+                    $sync.Error = "Reference folder inaccessible: $rp"
+                    $sync.Status = "Aborted - reference folder inaccessible: $rp"
+                    $sync.Done = $true
+                    return
+                }
+            }
+
             foreach ($folder in $folders) {
                 if ($token.IsCancellationRequested) { return }
-                $searchOpt = if ($recurse) { 'AllDirectories' } else { 'TopDirectoryOnly' }
                 try {
                     $enumOpts = [System.IO.EnumerationOptions]@{
                         RecurseSubdirectories = $recurse
@@ -901,13 +1017,45 @@ $controls.btnScan.Add_Click({
                 }
             }
 
+            # Reference-folder integrity guard: re-check mid-scan
+            foreach ($rp in $refPaths) {
+                if (-not [System.IO.Directory]::Exists($rp)) {
+                    $sync.Error = "Reference folder became inaccessible mid-scan: $rp"
+                    $sync.Status = "Aborted - reference folder inaccessible: $rp"
+                    $sync.Done = $true
+                    return
+                }
+            }
+
+            # Phase 6: Byte-compare verification (handles hash collision paranoia)
+            $sync.Phase = "verify"
+            $sync.Status = "Verifying with byte comparison..."
+            $verifiedGroups = @{}
+            foreach ($kv in $fullGroups.GetEnumerator()) {
+                if ($token.IsCancellationRequested) { return }
+                if ($kv.Value.Count -lt 2) { continue }
+                # For each hash group, verify all files are byte-identical to the first
+                $anchor = $kv.Value[0]
+                $verified = [System.Collections.Generic.List[PSCustomObject]]::new()
+                $verified.Add($anchor)
+                for ($vi = 1; $vi -lt $kv.Value.Count; $vi++) {
+                    if ($token.IsCancellationRequested) { return }
+                    $candidate = $kv.Value[$vi]
+                    if (Test-ByteIdentical $anchor.FullPath $candidate.FullPath) {
+                        $verified.Add($candidate)
+                    }
+                }
+                if ($verified.Count -ge 2) {
+                    $verifiedGroups[$kv.Key] = $verified
+                }
+            }
+
             # Build results
             $sync.Phase = "results"
             $groupNum = 0
             $dupFiles = 0
             $wastedBytes = 0L
-            foreach ($kv in $fullGroups.GetEnumerator()) {
-                if ($kv.Value.Count -lt 2) { continue }
+            foreach ($kv in $verifiedGroups.GetEnumerator()) {
                 $groupNum++
                 $first = $true
                 foreach ($f in ($kv.Value | Sort-Object Modified -Descending)) {
@@ -983,6 +1131,27 @@ $controls.btnScan.Add_Click({
                 $controls.txtStatus.Text = "Error: $($s.Error)"
             } else {
                 $controls.txtStats.Text = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted"
+
+                # Toast notification when window is not active
+                if (-not $window.IsActive) {
+                    try {
+                        $notifyIcon = [System.Windows.Forms.NotifyIcon]::new()
+                        $notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
+                        $notifyIcon.Visible = $true
+                        $toastMsg = "$($s.DuplicateGroups) duplicate groups found - $(Format-FileSize $s.WastedSpace) reclaimable"
+                        $notifyIcon.ShowBalloonTip(5000, "DuplicateFF - Scan Complete", $toastMsg, 'Info')
+                        # Clean up after a delay
+                        $cleanTimer = [System.Windows.Threading.DispatcherTimer]::new()
+                        $cleanTimer.Interval = [TimeSpan]::FromSeconds(6)
+                        $cleanTimer.Tag = $notifyIcon
+                        $cleanTimer.Add_Tick({
+                            $this.Tag.Visible = $false
+                            $this.Tag.Dispose()
+                            $this.Stop()
+                        })
+                        $cleanTimer.Start()
+                    } catch { }
+                }
             }
         }
     })
@@ -1082,6 +1251,68 @@ $controls.btnInvertSel.Add_Click({
     $controls.txtStatus.Text = "$selectedCount files selected"
 })
 
+# --- Rehearse Delete (Dry Run Preview) ---
+$controls.btnRehearse.Add_Click({
+    $selected = @($script:Results | Where-Object { $_.Selected -and -not $_.IsRef })
+    if ($selected.Count -eq 0) {
+        $controls.txtStatus.Text = "No files selected - nothing to rehearse"
+        return
+    }
+
+    $mode = ($controls.cmbDeleteMode.SelectedItem).Content
+    $modeVerb = switch ($mode) {
+        "Move to Recycle Bin"     { "Recycle" }
+        "Permanent Delete"        { "DELETE" }
+        "Replace with Hardlinks"  { "Hardlink" }
+    }
+
+    $totalSize = ($selected | Measure-Object -Property Size -Sum).Sum
+    $sb = [System.Text.StringBuilder]::new()
+    $sb.AppendLine("=== REHEARSAL (no files will be modified) ===") | Out-Null
+    $sb.AppendLine("Mode: $mode") | Out-Null
+    $sb.AppendLine("Files: $($selected.Count) | Space: $(Format-FileSize $totalSize)") | Out-Null
+    $sb.AppendLine("") | Out-Null
+
+    $locked = 0
+    $crossVol = 0
+    $missing = 0
+    foreach ($item in $selected) {
+        $issues = @()
+        if (-not [System.IO.File]::Exists($item.FullPath)) {
+            $issues += "MISSING"
+            $missing++
+        } else {
+            if (Test-FileLocked $item.FullPath) {
+                $issues += "LOCKED"
+                $locked++
+            }
+            if ($mode -eq "Replace with Hardlinks") {
+                $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
+                if ($original) {
+                    $srcVol = Get-VolumeRoot $item.FullPath
+                    $dstVol = Get-VolumeRoot $original.FullPath
+                    if ($srcVol -ne $dstVol) {
+                        $issues += "CROSS-VOLUME"
+                        $crossVol++
+                    }
+                }
+            }
+        }
+        $tag = if ($issues.Count -gt 0) { " [" + ($issues -join ', ') + "]" } else { "" }
+        $sb.AppendLine("  [$modeVerb] $($item.FullPath)$tag") | Out-Null
+    }
+
+    $sb.AppendLine("") | Out-Null
+    $sb.AppendLine("--- Summary ---") | Out-Null
+    $sb.AppendLine("Would process: $($selected.Count - $missing) files") | Out-Null
+    if ($locked -gt 0) { $sb.AppendLine("Locked files (will be skipped): $locked") | Out-Null }
+    if ($crossVol -gt 0) { $sb.AppendLine("Cross-volume hardlinks (impossible, will be skipped): $crossVol") | Out-Null }
+    if ($missing -gt 0) { $sb.AppendLine("Missing files: $missing") | Out-Null }
+
+    [System.Windows.MessageBox]::Show($sb.ToString(), "DuplicateFF - Rehearse Delete", 'OK', 'Information') | Out-Null
+    $controls.txtStatus.Text = "Rehearsal complete - no files were modified"
+})
+
 # --- Delete Selected ---
 $controls.btnDeleteSelected.Add_Click({
     $selected = @($script:Results | Where-Object { $_.Selected -and -not $_.IsRef })
@@ -1104,9 +1335,18 @@ $controls.btnDeleteSelected.Add_Click({
 
     $deleted = 0
     $errors = 0
+    $skippedLocked = 0
+    $skippedCrossVol = 0
     foreach ($item in $selected) {
         try {
             if (-not [System.IO.File]::Exists($item.FullPath)) { continue }
+
+            # Locked-file detection: skip and count instead of failing
+            if (Test-FileLocked $item.FullPath) {
+                $skippedLocked++
+                continue
+            }
+
             switch ($mode) {
                 "Move to Recycle Bin" {
                     Remove-ToRecycleBin $item.FullPath
@@ -1115,11 +1355,21 @@ $controls.btnDeleteSelected.Add_Click({
                     [System.IO.File]::Delete($item.FullPath)
                 }
                 "Replace with Hardlinks" {
-                    # Find the original in the same group
                     $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
                     if ($original -and [System.IO.File]::Exists($original.FullPath)) {
+                        # Cross-volume hardlink guard
+                        $srcVol = Get-VolumeRoot $item.FullPath
+                        $dstVol = Get-VolumeRoot $original.FullPath
+                        if ($srcVol -ne $dstVol) {
+                            $skippedCrossVol++
+                            continue
+                        }
                         [System.IO.File]::Delete($item.FullPath)
-                        cmd /c mklink /H "`"$($item.FullPath)`"" "`"$($original.FullPath)`"" 2>$null | Out-Null
+                        $hlResult = [Win32]::CreateHardLink($item.FullPath, $original.FullPath, [IntPtr]::Zero)
+                        if (-not $hlResult) {
+                            $errors++
+                            continue
+                        }
                     } else {
                         [System.IO.File]::Delete($item.FullPath)
                     }
@@ -1144,8 +1394,12 @@ $controls.btnDeleteSelected.Add_Click({
     $singles = @($script:Results | Where-Object { $groupCounts[$_.Group] -lt 2 })
     foreach ($s in $singles) { $script:Results.Remove($s) | Out-Null }
 
-    $errMsg = if ($errors -gt 0) { " ($errors errors)" } else { "" }
-    $controls.txtStatus.Text = "$deleted files deleted$errMsg - $(Format-FileSize $totalSize) reclaimed"
+    $statusParts = @("$deleted files deleted")
+    if ($skippedLocked -gt 0) { $statusParts += "$skippedLocked locked (skipped)" }
+    if ($skippedCrossVol -gt 0) { $statusParts += "$skippedCrossVol cross-volume (skipped)" }
+    if ($errors -gt 0) { $statusParts += "$errors errors" }
+    $statusParts += "$(Format-FileSize $totalSize) reclaimed"
+    $controls.txtStatus.Text = $statusParts -join ' | '
 })
 
 # --- Export CSV ---
@@ -1175,3 +1429,471 @@ $controls.btnExport.Add_Click({
 
 # --- Show Window ---
 $window.ShowDialog() | Out-Null
+
+} # end GUI MODE
+# ===================================================================
+# CLI MODE
+# ===================================================================
+else {
+
+    # --- CLI Helper Functions (same as GUI but running in-process) ---
+    function Format-FileSize([long]$bytes) {
+        if ($bytes -lt 1KB) { return "$bytes B" }
+        if ($bytes -lt 1MB) { return "{0:N1} KB" -f ($bytes / 1KB) }
+        if ($bytes -lt 1GB) { return "{0:N1} MB" -f ($bytes / 1MB) }
+        return "{0:N2} GB" -f ($bytes / 1GB)
+    }
+
+    function Get-MinSizeBytes([string]$label) {
+        switch ($label) {
+            "1 KB"    { return 1KB }
+            "10 KB"   { return 10KB }
+            "100 KB"  { return 100KB }
+            "1 MB"    { return 1MB }
+            "10 MB"   { return 10MB }
+            "100 MB"  { return 100MB }
+            default   { return 0 }
+        }
+    }
+
+    function Get-PartialHash([string]$path, [long]$offset, [long]$count) {
+        try {
+            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                $len = [Math]::Min($count, $fs.Length - $offset)
+                if ($len -le 0) { return "" }
+                $buf = [byte[]]::new($len)
+                $fs.Position = $offset
+                $read = $fs.Read($buf, 0, $buf.Length)
+                if ($read -gt 0) {
+                    return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
+                }
+            } finally { $fs.Dispose() }
+        } catch { return $null }
+        return $null
+    }
+
+    function Get-FileHashValue([string]$path) {
+        try {
+            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-','')
+            } finally { $fs.Dispose() }
+        } catch { return $null }
+    }
+
+    function Test-ByteIdentical([string]$pathA, [string]$pathB) {
+        try {
+            $fsA = [System.IO.File]::Open($pathA, 'Open', 'Read', 'ReadWrite')
+            try {
+                $fsB = [System.IO.File]::Open($pathB, 'Open', 'Read', 'ReadWrite')
+                try {
+                    if ($fsA.Length -ne $fsB.Length) { return $false }
+                    $bufSize = 65536
+                    $bufA = [byte[]]::new($bufSize)
+                    $bufB = [byte[]]::new($bufSize)
+                    while ($true) {
+                        $readA = $fsA.Read($bufA, 0, $bufSize)
+                        $readB = $fsB.Read($bufB, 0, $bufSize)
+                        if ($readA -ne $readB) { return $false }
+                        if ($readA -eq 0) { return $true }
+                        for ($i = 0; $i -lt $readA; $i++) {
+                            if ($bufA[$i] -ne $bufB[$i]) { return $false }
+                        }
+                    }
+                } finally { $fsB.Dispose() }
+            } finally { $fsA.Dispose() }
+        } catch { return $false }
+    }
+
+    function Remove-ToRecycleBin([string]$path) {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+            $path,
+            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+        )
+    }
+
+    function Get-VolumeRoot([string]$path) {
+        [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
+    }
+
+    function Test-FileLocked([string]$path) {
+        try {
+            $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+            $fs.Dispose()
+            return $false
+        } catch {
+            return $true
+        }
+    }
+
+    # Map CLI filter param to internal label
+    $filterLabel = switch ($Filter) {
+        'Images'    { "Images Only" }
+        'Videos'    { "Videos Only" }
+        'Audio'     { "Audio Only" }
+        'Documents' { "Documents" }
+        default     { "All Files" }
+    }
+
+    $imageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.ico','.svg','.heic','.heif','.avif')
+    $videoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
+    $audioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
+    $docExts   = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.rtf','.odt','.ods','.csv')
+
+    function Test-FileFilter([string]$ext, [string]$filter) {
+        switch ($filter) {
+            "Images Only"  { return $ext -in $imageExts }
+            "Videos Only"  { return $ext -in $videoExts }
+            "Audio Only"   { return $ext -in $audioExts }
+            "Documents"    { return $ext -in $docExts }
+            default        { return $true }
+        }
+    }
+
+    $recurse = -not $NoSubfolders
+    $skipZero = -not $IncludeZeroByte
+    $minSizeBytes = Get-MinSizeBytes $MinSize
+
+    # Build folder list
+    $refPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($Reference) {
+        foreach ($rp in $Reference) {
+            $resolved = (Resolve-Path $rp -ErrorAction SilentlyContinue).Path
+            if ($resolved) { $refPaths.Add($resolved) | Out-Null }
+            else {
+                Write-Error "Reference folder not found: $rp"
+                exit 3
+            }
+        }
+    }
+
+    $allScanPaths = @()
+    foreach ($sp in $Scan) {
+        $resolved = (Resolve-Path $sp -ErrorAction SilentlyContinue).Path
+        if ($resolved) { $allScanPaths += $resolved }
+        else { Write-Error "Scan folder not found: $sp"; exit 3 }
+    }
+
+    if (-not $Silent) { Write-Host "DuplicateFF v1.1.0 - CLI Mode" }
+    if (-not $Silent) { Write-Host "Scanning: $($allScanPaths -join ', ')" }
+    if ($refPaths.Count -gt 0 -and -not $Silent) { Write-Host "Reference: $($refPaths -join ', ')" }
+
+    # Phase 1: Enumerate
+    if (-not $Silent) { Write-Host "Phase 1: Enumerating files..." }
+    $allFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($scanPath in $allScanPaths) {
+        $enumOpts = [System.IO.EnumerationOptions]@{
+            RecurseSubdirectories = $recurse
+            IgnoreInaccessible = $true
+            AttributesToSkip = 'ReparsePoint'
+        }
+        $di = [System.IO.DirectoryInfo]::new($scanPath)
+        foreach ($fi in $di.EnumerateFiles('*', $enumOpts)) {
+            if ($skipZero -and $fi.Length -eq 0) { continue }
+            if ($fi.Length -lt $minSizeBytes) { continue }
+            $ext = $fi.Extension.ToLowerInvariant()
+            if (-not (Test-FileFilter $ext $filterLabel)) { continue }
+            $isRef = $false
+            foreach ($rp in $refPaths) {
+                if ($fi.FullName.StartsWith($rp, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $isRef = $true; break
+                }
+            }
+            $allFiles.Add([PSCustomObject]@{
+                FullPath = $fi.FullName; FileName = $fi.Name
+                Size = $fi.Length; Modified = $fi.LastWriteTime; IsRef = $isRef
+            })
+        }
+    }
+    # Also enumerate reference folders
+    foreach ($rp in $refPaths) {
+        if ($rp -notin $allScanPaths) {
+            $enumOpts = [System.IO.EnumerationOptions]@{
+                RecurseSubdirectories = $recurse
+                IgnoreInaccessible = $true
+                AttributesToSkip = 'ReparsePoint'
+            }
+            $di = [System.IO.DirectoryInfo]::new($rp)
+            foreach ($fi in $di.EnumerateFiles('*', $enumOpts)) {
+                if ($skipZero -and $fi.Length -eq 0) { continue }
+                if ($fi.Length -lt $minSizeBytes) { continue }
+                $ext = $fi.Extension.ToLowerInvariant()
+                if (-not (Test-FileFilter $ext $filterLabel)) { continue }
+                $allFiles.Add([PSCustomObject]@{
+                    FullPath = $fi.FullName; FileName = $fi.Name
+                    Size = $fi.Length; Modified = $fi.LastWriteTime; IsRef = $true
+                })
+            }
+        }
+    }
+    if (-not $Silent) { Write-Host "  Found $($allFiles.Count) files" }
+
+    # Phase 2: Size grouping
+    if (-not $Silent) { Write-Host "Phase 2: Grouping by size..." }
+    $sizeGroups = @{}
+    foreach ($f in $allFiles) {
+        if (-not $sizeGroups.ContainsKey($f.Size)) {
+            $sizeGroups[$f.Size] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $sizeGroups[$f.Size].Add($f)
+    }
+    $candidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($kv in $sizeGroups.GetEnumerator()) {
+        if ($kv.Value.Count -gt 1) { foreach ($f in $kv.Value) { $candidates.Add($f) } }
+    }
+    if (-not $Silent) { Write-Host "  $($candidates.Count) candidates ($($allFiles.Count - $candidates.Count) eliminated)" }
+    if ($candidates.Count -eq 0) {
+        if (-not $Silent) { Write-Host "No duplicates found." }
+        if ($Json) { Write-Output "[]" }
+        exit 0
+    }
+
+    # Phase 3: Prefix hash
+    if (-not $Silent) { Write-Host "Phase 3: Prefix hashing..." }
+    $prefixGroups = @{}
+    foreach ($f in $candidates) {
+        $key = "$($f.Size)|$(Get-PartialHash $f.FullPath 0 4096)"
+        if ($null -eq $key -or $key -match '\|$') { continue }
+        if (-not $prefixGroups.ContainsKey($key)) {
+            $prefixGroups[$key] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $prefixGroups[$key].Add($f)
+    }
+    $prefixCandidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($kv in $prefixGroups.GetEnumerator()) {
+        if ($kv.Value.Count -gt 1) { foreach ($f in $kv.Value) { $prefixCandidates.Add($f) } }
+    }
+    if (-not $Silent) { Write-Host "  $($prefixCandidates.Count) candidates remain" }
+    if ($prefixCandidates.Count -eq 0) {
+        if (-not $Silent) { Write-Host "No duplicates found." }
+        if ($Json) { Write-Output "[]" }
+        exit 0
+    }
+
+    # Phase 4: Suffix hash
+    if (-not $Silent) { Write-Host "Phase 4: Suffix hashing..." }
+    $suffixGroups = @{}
+    foreach ($f in $prefixCandidates) {
+        $suffixOffset = [Math]::Max(0, $f.Size - 4096)
+        $key = "$($f.Size)|$(Get-PartialHash $f.FullPath $suffixOffset 4096)"
+        if ($null -eq $key -or $key -match '\|$') { continue }
+        if (-not $suffixGroups.ContainsKey($key)) {
+            $suffixGroups[$key] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $suffixGroups[$key].Add($f)
+    }
+    $suffixCandidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($kv in $suffixGroups.GetEnumerator()) {
+        if ($kv.Value.Count -gt 1) { foreach ($f in $kv.Value) { $suffixCandidates.Add($f) } }
+    }
+    if (-not $Silent) { Write-Host "  $($suffixCandidates.Count) candidates remain" }
+    if ($suffixCandidates.Count -eq 0) {
+        if (-not $Silent) { Write-Host "No duplicates found." }
+        if ($Json) { Write-Output "[]" }
+        exit 0
+    }
+
+    # Phase 5: Full hash
+    if (-not $Silent) { Write-Host "Phase 5: Full hashing..." }
+    $fullGroups = @{}
+    foreach ($f in $suffixCandidates) {
+        $hash = Get-FileHashValue $f.FullPath
+        if ($null -eq $hash) { continue }
+        if (-not $fullGroups.ContainsKey($hash)) {
+            $fullGroups[$hash] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $fullGroups[$hash].Add($f)
+    }
+
+    # Phase 6: Byte-compare verification
+    if (-not $Silent) { Write-Host "Phase 6: Byte verification..." }
+    $verifiedGroups = @{}
+    foreach ($kv in $fullGroups.GetEnumerator()) {
+        if ($kv.Value.Count -lt 2) { continue }
+        $anchor = $kv.Value[0]
+        $verified = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $verified.Add($anchor)
+        for ($vi = 1; $vi -lt $kv.Value.Count; $vi++) {
+            if (Test-ByteIdentical $anchor.FullPath $kv.Value[$vi].FullPath) {
+                $verified.Add($kv.Value[$vi])
+            }
+        }
+        if ($verified.Count -ge 2) { $verifiedGroups[$kv.Key] = $verified }
+    }
+
+    # Build results
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $groupNum = 0
+    $dupFiles = 0
+    $wastedBytes = 0L
+    foreach ($kv in $verifiedGroups.GetEnumerator()) {
+        $groupNum++
+        $first = $true
+        foreach ($f in ($kv.Value | Sort-Object Modified -Descending)) {
+            $status = if ($f.IsRef) { "REF" } elseif ($first) { "Original" } else { "Duplicate" }
+            $results.Add([PSCustomObject]@{
+                Group      = $groupNum
+                FileName   = $f.FileName
+                FullPath   = $f.FullPath
+                FolderPath = [System.IO.Path]::GetDirectoryName($f.FullPath)
+                Size       = $f.Size
+                SizeDisplay = Format-FileSize $f.Size
+                Modified   = $f.Modified.ToString("yyyy-MM-dd HH:mm")
+                ModifiedDt = $f.Modified
+                IsRef      = $f.IsRef
+                Status     = $status
+                Selected   = $false
+                Hash       = $kv.Key
+            })
+            if (-not $first) { $dupFiles++; $wastedBytes += $f.Size }
+            $first = $false
+        }
+    }
+
+    if (-not $Silent) {
+        Write-Host "Found $groupNum duplicate groups ($dupFiles duplicate files, $(Format-FileSize $wastedBytes) wasted)"
+    }
+
+    if ($results.Count -eq 0) {
+        if ($Json) { Write-Output "[]" }
+        exit 0
+    }
+
+    # Apply auto-select if specified
+    if ($AutoSelect) {
+        $groups = @{}
+        foreach ($r in $results) {
+            if (-not $groups.ContainsKey($r.Group)) {
+                $groups[$r.Group] = [System.Collections.Generic.List[PSCustomObject]]::new()
+            }
+            $groups[$r.Group].Add($r)
+        }
+        foreach ($kv in $groups.GetEnumerator()) {
+            $items = $kv.Value
+            $keepItem = switch ($AutoSelect) {
+                'KeepNewest'       { ($items | Sort-Object ModifiedDt -Descending)[0] }
+                'KeepOldest'       { ($items | Sort-Object ModifiedDt)[0] }
+                'KeepReference'    { $ref = $items | Where-Object { $_.IsRef } | Select-Object -First 1; if ($ref) { $ref } else { $items[0] } }
+                'KeepLargest'      { ($items | Sort-Object Size -Descending)[0] }
+                'KeepShortestPath' { ($items | Sort-Object { $_.FullPath.Length })[0] }
+            }
+            foreach ($i in $items) {
+                if ($i.IsRef) { $i.Selected = $false; continue }
+                $i.Selected = ($i -ne $keepItem)
+            }
+        }
+    }
+
+    # DryRun mode: just report what would happen
+    if ($DryRun -and $Delete) {
+        $selected = @($results | Where-Object { $_.Selected -and -not $_.IsRef })
+        if (-not $Silent) {
+            Write-Host "`n=== DRY RUN (no files will be modified) ==="
+            Write-Host "Delete mode: $Delete"
+            foreach ($item in $selected) {
+                $issues = @()
+                if (Test-FileLocked $item.FullPath) { $issues += "LOCKED" }
+                if ($Delete -eq 'Hardlink') {
+                    $original = $results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected } | Select-Object -First 1
+                    if ($original) {
+                        $srcVol = Get-VolumeRoot $item.FullPath
+                        $dstVol = Get-VolumeRoot $original.FullPath
+                        if ($srcVol -ne $dstVol) { $issues += "CROSS-VOLUME" }
+                    }
+                }
+                $tag = if ($issues.Count -gt 0) { " [" + ($issues -join ', ') + "]" } else { "" }
+                Write-Host "  [Would delete] $($item.FullPath)$tag"
+            }
+            $totalSize = ($selected | Measure-Object -Property Size -Sum).Sum
+            Write-Host "Total: $($selected.Count) files, $(Format-FileSize $totalSize)"
+        }
+        exit 0
+    }
+
+    # Execute delete if requested
+    if ($Delete -and $AutoSelect) {
+        $selected = @($results | Where-Object { $_.Selected -and -not $_.IsRef })
+        $deleted = 0
+        $errors = 0
+        $skippedLocked = 0
+        $skippedCrossVol = 0
+        foreach ($item in $selected) {
+            if (-not [System.IO.File]::Exists($item.FullPath)) { continue }
+            if (Test-FileLocked $item.FullPath) { $skippedLocked++; continue }
+            try {
+                switch ($Delete) {
+                    'RecycleBin' { Remove-ToRecycleBin $item.FullPath }
+                    'Permanent'  { [System.IO.File]::Delete($item.FullPath) }
+                    'Hardlink'   {
+                        $original = $results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected } | Select-Object -First 1
+                        if ($original -and [System.IO.File]::Exists($original.FullPath)) {
+                            $srcVol = Get-VolumeRoot $item.FullPath
+                            $dstVol = Get-VolumeRoot $original.FullPath
+                            if ($srcVol -ne $dstVol) { $skippedCrossVol++; continue }
+                            [System.IO.File]::Delete($item.FullPath)
+                            $hlResult = [Win32]::CreateHardLink($item.FullPath, $original.FullPath, [IntPtr]::Zero)
+                            if (-not $hlResult) { $errors++; continue }
+                        }
+                    }
+                }
+                $deleted++
+            } catch { $errors++ }
+        }
+        if (-not $Silent) {
+            $totalSize = ($selected | Measure-Object -Property Size -Sum).Sum
+            $parts = @("$deleted files deleted")
+            if ($skippedLocked -gt 0) { $parts += "$skippedLocked locked (skipped)" }
+            if ($skippedCrossVol -gt 0) { $parts += "$skippedCrossVol cross-volume (skipped)" }
+            if ($errors -gt 0) { $parts += "$errors errors" }
+            $parts += "$(Format-FileSize $totalSize) reclaimed"
+            Write-Host ($parts -join ' | ')
+        }
+    }
+
+    # Output results
+    if ($Json) {
+        $output = $results | Select-Object Group, Status, FileName, FullPath, FolderPath, SizeDisplay, Size, Modified, IsRef, Hash, Selected
+        $output | ConvertTo-Json -Depth 5
+    } elseif ($ReportPath) {
+        $sb = [System.Text.StringBuilder]::new()
+        $sb.AppendLine("Group,Selected,Status,FileName,Size,SizeBytes,Modified,FolderPath,FullPath,Hash") | Out-Null
+        foreach ($r in $results) {
+            $fn = $r.FileName -replace '"','""'
+            $fp = $r.FolderPath -replace '"','""'
+            $full = $r.FullPath -replace '"','""'
+            $sb.AppendLine("$($r.Group),$($r.Selected),$($r.Status),`"$fn`",$($r.SizeDisplay),$($r.Size),$($r.Modified),`"$fp`",`"$full`",$($r.Hash)") | Out-Null
+        }
+        [System.IO.File]::WriteAllText($ReportPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        if (-not $Silent) { Write-Host "Report saved to $ReportPath" }
+    } elseif (-not $Silent -and -not $Delete) {
+        # Default text output
+        $lastGroup = 0
+        foreach ($r in $results) {
+            if ($r.Group -ne $lastGroup) {
+                if ($lastGroup -gt 0) { Write-Host "" }
+                Write-Host "--- Group $($r.Group) ($($r.SizeDisplay) each) ---" -ForegroundColor Cyan
+                $lastGroup = $r.Group
+            }
+            $prefix = switch ($r.Status) {
+                "REF"       { "[REF]  " }
+                "Original"  { "[KEEP] " }
+                "Duplicate" { "[DUP]  " }
+            }
+            $color = switch ($r.Status) {
+                "REF"       { "Green" }
+                "Original"  { "White" }
+                "Duplicate" { "Yellow" }
+            }
+            Write-Host "  $prefix$($r.FullPath)" -ForegroundColor $color
+        }
+    }
+
+    # Exit codes: 0 success, 1 partial (had errors), 2 user-cancelled (N/A in CLI batch), 3 ref folder unreadable
+    if ($errors -gt 0 -and $deleted -gt 0) { exit 1 }
+    exit 0
+
+} # end CLI MODE
