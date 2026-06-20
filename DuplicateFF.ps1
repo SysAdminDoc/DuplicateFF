@@ -1667,91 +1667,139 @@ $controls.btnDeleteSelected.Add_Click({
     $result = [System.Windows.MessageBox]::Show($msg, "DuplicateFF - Confirm", 'YesNo', 'Warning')
     if ($result -ne 'Yes') { return }
 
-    $deleted = 0
-    $errors = 0
-    $skippedLocked = 0
-    $skippedCrossVol = 0
-    $actionLog = [System.Collections.Generic.List[PSCustomObject]]::new()
+    # Build operation list on UI thread (fast), execute I/O on background thread
+    $ops = [System.Collections.ArrayList]::new()
     foreach ($item in $selected) {
-        try {
-            if (-not [System.IO.File]::Exists($item.FullPath)) { continue }
+        $op = @{ Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Group = $item.Group; Mode = $mode; OriginalPath = $null }
+        if ($mode -eq "Replace with Hardlinks") {
+            $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
+            if ($original) { $op.OriginalPath = $original.FullPath }
+        }
+        $ops.Add($op) | Out-Null
+    }
 
-            if (Test-FileLocked $item.FullPath) {
-                $skippedLocked++
-                $actionLog.Add([PSCustomObject]@{ Action = "Skipped"; Reason = "Locked"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
-                continue
-            }
+    $controls.btnDeleteSelected.IsEnabled = $false
+    $controls.prgScan.Visibility = 'Visible'
+    $controls.prgScan.IsIndeterminate = $false
+    $controls.prgScan.Maximum = $ops.Count
+    $controls.prgScan.Value = 0
+    $controls.txtStatus.Text = "Deleting 0/$($ops.Count)..."
 
-            switch ($mode) {
-                "Move to Recycle Bin" {
-                    Remove-ToRecycleBin $item.FullPath
-                    $actionLog.Add([PSCustomObject]@{ Action = "RecycleBin"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
+    $delSync = [hashtable]::Synchronized(@{
+        Deleted = 0; Errors = 0; SkippedLocked = 0; SkippedCrossVol = 0
+        Processed = 0; Total = $ops.Count; TotalSize = $totalSize
+        ActionLog = [System.Collections.ArrayList]::new()
+        LogPath = $null; Done = $false
+    })
+
+    $delPs = [PowerShell]::Create()
+    $delPs.AddScript({
+        param($ops, $delSync)
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        foreach ($op in $ops) {
+            try {
+                if (-not [System.IO.File]::Exists($op.Path)) { $delSync.Processed++; continue }
+                try {
+                    $lockTest = [System.IO.File]::Open($op.Path, 'Open', 'ReadWrite', 'None')
+                    $lockTest.Dispose()
+                } catch {
+                    $delSync.SkippedLocked++
+                    $delSync.ActionLog.Add(@{ Action = "Skipped"; Reason = "Locked"; Path = $op.Path }) | Out-Null
+                    $delSync.Processed++
+                    continue
                 }
-                "Permanent Delete" {
-                    [System.IO.File]::Delete($item.FullPath)
-                    $actionLog.Add([PSCustomObject]@{ Action = "Deleted"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
-                }
-                "Replace with Hardlinks" {
-                    $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
-                    if ($original -and [System.IO.File]::Exists($original.FullPath)) {
-                        $srcVol = Get-VolumeRoot $item.FullPath
-                        $dstVol = Get-VolumeRoot $original.FullPath
-                        if ($srcVol -ne $dstVol) {
-                            $skippedCrossVol++
-                            $actionLog.Add([PSCustomObject]@{ Action = "Skipped"; Reason = "CrossVolume"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
-                            continue
+                switch ($op.Mode) {
+                    "Move to Recycle Bin" {
+                        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($op.Path,
+                            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+                        $delSync.ActionLog.Add(@{ Action = "RecycleBin"; Path = $op.Path; Size = $op.Size; Hash = $op.Hash }) | Out-Null
+                    }
+                    "Permanent Delete" {
+                        [System.IO.File]::Delete($op.Path)
+                        $delSync.ActionLog.Add(@{ Action = "Deleted"; Path = $op.Path; Size = $op.Size; Hash = $op.Hash }) | Out-Null
+                    }
+                    "Replace with Hardlinks" {
+                        if ($op.OriginalPath -and [System.IO.File]::Exists($op.OriginalPath)) {
+                            $srcVol = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($op.Path))
+                            $dstVol = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($op.OriginalPath))
+                            if ($srcVol -ne $dstVol) {
+                                $delSync.SkippedCrossVol++
+                                $delSync.ActionLog.Add(@{ Action = "Skipped"; Reason = "CrossVolume"; Path = $op.Path }) | Out-Null
+                                $delSync.Processed++
+                                continue
+                            }
+                            $tempLink = $op.Path + ".dff_hardlink_tmp"
+                            $hlResult = [Win32]::CreateHardLink($tempLink, $op.OriginalPath, [IntPtr]::Zero)
+                            if (-not $hlResult) {
+                                $delSync.Errors++
+                                $delSync.ActionLog.Add(@{ Action = "Failed"; Reason = "HardlinkFailed"; Path = $op.Path }) | Out-Null
+                                $delSync.Processed++
+                                continue
+                            }
+                            [System.IO.File]::Delete($op.Path)
+                            [System.IO.File]::Move($tempLink, $op.Path)
+                            $delSync.ActionLog.Add(@{ Action = "Hardlinked"; Path = $op.Path; Target = $op.OriginalPath; Size = $op.Size }) | Out-Null
+                        } else {
+                            [System.IO.File]::Delete($op.Path)
+                            $delSync.ActionLog.Add(@{ Action = "Deleted"; Path = $op.Path; Size = $op.Size }) | Out-Null
                         }
-                        $tempLink = $item.FullPath + ".dff_hardlink_tmp"
-                        $hlResult = [Win32]::CreateHardLink($tempLink, $original.FullPath, [IntPtr]::Zero)
-                        if (-not $hlResult) {
-                            $errors++
-                            $actionLog.Add([PSCustomObject]@{ Action = "Failed"; Reason = "HardlinkFailed"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
-                            continue
-                        }
-                        [System.IO.File]::Delete($item.FullPath)
-                        [System.IO.File]::Move($tempLink, $item.FullPath)
-                        $actionLog.Add([PSCustomObject]@{ Action = "Hardlinked"; Path = $item.FullPath; Target = $original.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
-                    } else {
-                        [System.IO.File]::Delete($item.FullPath)
-                        $actionLog.Add([PSCustomObject]@{ Action = "Deleted"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                     }
                 }
+                $delSync.Deleted++
+            } catch {
+                $delSync.Errors++
+                $delSync.ActionLog.Add(@{ Action = "Error"; Path = $op.Path; Error = $_.Exception.Message }) | Out-Null
             }
-            $deleted++
-        } catch {
-            $errors++
-            $actionLog.Add([PSCustomObject]@{ Action = "Error"; Path = $item.FullPath; Error = $_.Exception.Message; Timestamp = (Get-Date -Format 'o') })
+            $delSync.Processed++
         }
-    }
+        if ($delSync.ActionLog.Count -gt 0) {
+            try {
+                $delSync.LogPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+                    "DuplicateFF_Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').json")
+                $delSync.ActionLog | ConvertTo-Json -Depth 3 | Set-Content -Path $delSync.LogPath -Encoding UTF8
+            } catch { }
+        }
+        $delSync.Done = $true
+    }).AddArgument($ops).AddArgument($delSync)
 
-    # Write action log
-    if ($actionLog.Count -gt 0) {
-        try {
-            $logPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "DuplicateFF_Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').json")
-            $actionLog | ConvertTo-Json -Depth 3 | Set-Content -Path $logPath -Encoding UTF8
-        } catch { }
-    }
+    $delHandle = $delPs.BeginInvoke()
 
-    # Remove deleted items from results
-    $toRemove = @($script:Results | Where-Object { $_.Selected -and -not [System.IO.File]::Exists($_.FullPath) })
-    foreach ($r in $toRemove) { $script:Results.Remove($r) | Out-Null }
+    $delTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $delTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+    $delTimer.Tag = @{ PS = $delPs; Handle = $delHandle; Sync = $delSync }
+    $delTimer.Add_Tick({
+        $ctx = $this.Tag
+        $ds = $ctx.Sync
+        $controls.prgScan.Value = $ds.Processed
+        $controls.txtStatus.Text = "Deleting $($ds.Processed)/$($ds.Total)..."
+        if ($ds.Done) {
+            $this.Stop()
+            $ctx.PS.EndInvoke($ctx.Handle)
+            $ctx.PS.Dispose()
 
-    # Clean up groups with only 1 remaining
-    $groupCounts = @{}
-    foreach ($r in $script:Results) {
-        if (-not $groupCounts.ContainsKey($r.Group)) { $groupCounts[$r.Group] = 0 }
-        $groupCounts[$r.Group]++
-    }
-    $singles = @($script:Results | Where-Object { $groupCounts[$_.Group] -lt 2 })
-    foreach ($s in $singles) { $script:Results.Remove($s) | Out-Null }
+            $toRemove = @($script:Results | Where-Object { $_.Selected -and -not [System.IO.File]::Exists($_.FullPath) })
+            foreach ($r in $toRemove) { $script:Results.Remove($r) | Out-Null }
+            $groupCounts = @{}
+            foreach ($r in $script:Results) {
+                if (-not $groupCounts.ContainsKey($r.Group)) { $groupCounts[$r.Group] = 0 }
+                $groupCounts[$r.Group]++
+            }
+            $singles = @($script:Results | Where-Object { $groupCounts[$_.Group] -lt 2 })
+            foreach ($s in $singles) { $script:Results.Remove($s) | Out-Null }
 
-    $statusParts = @("$deleted files deleted")
-    if ($skippedLocked -gt 0) { $statusParts += "$skippedLocked locked (skipped)" }
-    if ($skippedCrossVol -gt 0) { $statusParts += "$skippedCrossVol cross-volume (skipped)" }
-    if ($errors -gt 0) { $statusParts += "$errors errors" }
-    $statusParts += "$(Format-FileSize $totalSize) reclaimed"
-    if ($logPath) { $statusParts += "Log: $logPath" }
-    $controls.txtStatus.Text = $statusParts -join ' | '
+            $controls.prgScan.Visibility = 'Collapsed'
+            $controls.btnDeleteSelected.IsEnabled = $true
+            $statusParts = @("$($ds.Deleted) files deleted")
+            if ($ds.SkippedLocked -gt 0) { $statusParts += "$($ds.SkippedLocked) locked (skipped)" }
+            if ($ds.SkippedCrossVol -gt 0) { $statusParts += "$($ds.SkippedCrossVol) cross-volume (skipped)" }
+            if ($ds.Errors -gt 0) { $statusParts += "$($ds.Errors) errors" }
+            $statusParts += "$(Format-FileSize $ds.TotalSize) reclaimed"
+            if ($ds.LogPath) { $statusParts += "Log: $($ds.LogPath)" }
+            $controls.txtStatus.Text = $statusParts -join ' | '
+        }
+    })
+    $delTimer.Start()
 })
 
 # --- Export CSV ---
