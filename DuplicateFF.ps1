@@ -1587,22 +1587,25 @@ $controls.btnDeleteSelected.Add_Click({
     $errors = 0
     $skippedLocked = 0
     $skippedCrossVol = 0
+    $actionLog = [System.Collections.Generic.List[PSCustomObject]]::new()
     foreach ($item in $selected) {
         try {
             if (-not [System.IO.File]::Exists($item.FullPath)) { continue }
 
-            # Locked-file detection: skip and count instead of failing
             if (Test-FileLocked $item.FullPath) {
                 $skippedLocked++
+                $actionLog.Add([PSCustomObject]@{ Action = "Skipped"; Reason = "Locked"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                 continue
             }
 
             switch ($mode) {
                 "Move to Recycle Bin" {
                     Remove-ToRecycleBin $item.FullPath
+                    $actionLog.Add([PSCustomObject]@{ Action = "RecycleBin"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                 }
                 "Permanent Delete" {
                     [System.IO.File]::Delete($item.FullPath)
+                    $actionLog.Add([PSCustomObject]@{ Action = "Deleted"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                 }
                 "Replace with Hardlinks" {
                     $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
@@ -1611,25 +1614,38 @@ $controls.btnDeleteSelected.Add_Click({
                         $dstVol = Get-VolumeRoot $original.FullPath
                         if ($srcVol -ne $dstVol) {
                             $skippedCrossVol++
+                            $actionLog.Add([PSCustomObject]@{ Action = "Skipped"; Reason = "CrossVolume"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                             continue
                         }
                         $tempLink = $item.FullPath + ".dff_hardlink_tmp"
                         $hlResult = [Win32]::CreateHardLink($tempLink, $original.FullPath, [IntPtr]::Zero)
                         if (-not $hlResult) {
                             $errors++
+                            $actionLog.Add([PSCustomObject]@{ Action = "Failed"; Reason = "HardlinkFailed"; Path = $item.FullPath; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                             continue
                         }
                         [System.IO.File]::Delete($item.FullPath)
                         [System.IO.File]::Move($tempLink, $item.FullPath)
+                        $actionLog.Add([PSCustomObject]@{ Action = "Hardlinked"; Path = $item.FullPath; Target = $original.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                     } else {
                         [System.IO.File]::Delete($item.FullPath)
+                        $actionLog.Add([PSCustomObject]@{ Action = "Deleted"; Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Timestamp = (Get-Date -Format 'o') })
                     }
                 }
             }
             $deleted++
         } catch {
             $errors++
+            $actionLog.Add([PSCustomObject]@{ Action = "Error"; Path = $item.FullPath; Error = $_.Exception.Message; Timestamp = (Get-Date -Format 'o') })
         }
+    }
+
+    # Write action log
+    if ($actionLog.Count -gt 0) {
+        try {
+            $logPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "DuplicateFF_Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').json")
+            $actionLog | ConvertTo-Json -Depth 3 | Set-Content -Path $logPath -Encoding UTF8
+        } catch { }
     }
 
     # Remove deleted items from results
@@ -1650,6 +1666,7 @@ $controls.btnDeleteSelected.Add_Click({
     if ($skippedCrossVol -gt 0) { $statusParts += "$skippedCrossVol cross-volume (skipped)" }
     if ($errors -gt 0) { $statusParts += "$errors errors" }
     $statusParts += "$(Format-FileSize $totalSize) reclaimed"
+    if ($logPath) { $statusParts += "Log: $logPath" }
     $controls.txtStatus.Text = $statusParts -join ' | '
 })
 
