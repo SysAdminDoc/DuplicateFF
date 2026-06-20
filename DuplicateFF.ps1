@@ -39,15 +39,32 @@ if (-not $script:CLIMode) {
     Add-Type -AssemblyName Microsoft.VisualBasic
 }
 
-# --- P/Invoke for console hiding ---
+# --- P/Invoke ---
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct BY_HANDLE_FILE_INFORMATION {
+    public uint FileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+
 public class Win32 {
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
 }
 "@
 if (-not $script:CLIMode) {
@@ -158,6 +175,19 @@ function Remove-ToRecycleBin([string]$path) {
         [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
         [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
     )
+}
+
+function Get-NtfsFileId([string]$path) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $info = [BY_HANDLE_FILE_INFORMATION]::new()
+            if ([Win32]::GetFileInformationByHandle($fs.SafeFileHandle.DangerousGetHandle(), [ref]$info)) {
+                return "$($info.VolumeSerialNumber):$($info.FileIndexHigh):$($info.FileIndexLow)"
+            }
+        } finally { $fs.Dispose() }
+    } catch { }
+    return $null
 }
 
 function Get-VolumeRoot([string]$path) {
@@ -973,6 +1003,7 @@ $controls.btnScan.Add_Click({
         WastedSpace = 0L
         Results = [System.Collections.ArrayList]::new()
         Errors = [System.Collections.ArrayList]::new()
+        HardlinkExcluded = 0
         Done = $false
         Error = $null
     })
@@ -1088,6 +1119,19 @@ $controls.btnScan.Add_Click({
             } catch { return $false }
         }
 
+        function Get-NtfsFileId([string]$path) {
+            try {
+                $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $info = [BY_HANDLE_FILE_INFORMATION]::new()
+                    if ([Win32]::GetFileInformationByHandle($fs.SafeFileHandle.DangerousGetHandle(), [ref]$info)) {
+                        return "$($info.VolumeSerialNumber):$($info.FileIndexHigh):$($info.FileIndexLow)"
+                    }
+                } finally { $fs.Dispose() }
+            } catch { }
+            return $null
+        }
+
         try {
             $minSize = Get-MinSizeBytes $minSizeLabel
             $maxSize = Get-MaxSizeBytes $maxSizeLabel
@@ -1163,6 +1207,30 @@ $controls.btnScan.Add_Click({
             }
 
             if ($token.IsCancellationRequested) { return }
+
+            # Phase 1b: Exclude existing NTFS hardlinks (same file ID = same data)
+            $sync.Status = "Checking for hardlinks..."
+            $fileIdMap = @{}
+            $hardlinkExcluded = 0
+            $dedupedFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($f in $allFiles) {
+                $fid = Get-NtfsFileId $f.FullPath
+                if ($null -ne $fid) {
+                    if ($fileIdMap.ContainsKey($fid)) {
+                        $hardlinkExcluded++
+                        continue
+                    }
+                    $fileIdMap[$fid] = $true
+                }
+                $dedupedFiles.Add($f)
+            }
+            if ($hardlinkExcluded -gt 0) {
+                $sync.Status = "Excluded $hardlinkExcluded hardlinked files"
+            }
+            $allFiles = $dedupedFiles
+            $fileIdMap = $null
+            $sync.HardlinkExcluded = $hardlinkExcluded
+
             $sync.Status = "Grouping by size... ($($allFiles.Count) files)"
             $sync.Phase = "size"
 
@@ -1392,6 +1460,7 @@ $controls.btnScan.Add_Click({
                 $controls.txtStatus.Text = "Error: $($s.Error)"
             } else {
                 $statsText = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted | $elapsedStr"
+                if ($s.HardlinkExcluded -gt 0) { $statsText += " | $($s.HardlinkExcluded) hardlinks excluded" }
                 if ($s.Errors.Count -gt 0) { $statsText += " | $($s.Errors.Count) errors" }
                 $controls.txtStats.Text = $statsText
 
@@ -1834,6 +1903,27 @@ else {
         }
     }
     if (-not $Silent) { Write-Host "  Found $($allFiles.Count) files" }
+
+    # Phase 1b: Exclude existing NTFS hardlinks
+    $fileIdMap = @{}
+    $hardlinkExcluded = 0
+    $dedupedFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($f in $allFiles) {
+        $fid = Get-NtfsFileId $f.FullPath
+        if ($null -ne $fid) {
+            if ($fileIdMap.ContainsKey($fid)) {
+                $hardlinkExcluded++
+                continue
+            }
+            $fileIdMap[$fid] = $true
+        }
+        $dedupedFiles.Add($f)
+    }
+    $allFiles = $dedupedFiles
+    $fileIdMap = $null
+    if ($hardlinkExcluded -gt 0 -and -not $Silent) {
+        Write-Host "  Excluded $hardlinkExcluded hardlinked files"
+    }
 
     # Phase 2: Size grouping
     if (-not $Silent) { Write-Host "Phase 2: Grouping by size..." }
