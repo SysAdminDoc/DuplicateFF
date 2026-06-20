@@ -402,6 +402,7 @@ $script:Colors = @{
                         <DataGridCheckBoxColumn Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" Width="35"
                                                 Header="" ElementStyle="{x:Null}"/>
                         <DataGridTextColumn Binding="{Binding Group}" Header="Group" Width="55"/>
+                        <DataGridTextColumn Binding="{Binding GroupInfo}" Header="Group Info" Width="120"/>
                         <DataGridTextColumn Binding="{Binding FileName}" Header="File Name" Width="*" MinWidth="150"/>
                         <DataGridTextColumn Binding="{Binding SizeDisplay}" Header="Size" Width="85"/>
                         <DataGridTextColumn Binding="{Binding Modified}" Header="Modified" Width="130"/>
@@ -568,12 +569,14 @@ function Get-PartialHash([string]$path, [long]$offset, [long]$count) {
         $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
         try {
             $sha = [System.Security.Cryptography.SHA256]::Create()
-            $buf = [byte[]]::new([Math]::Min($count, $fs.Length - $offset))
-            $fs.Position = $offset
-            $read = $fs.Read($buf, 0, $buf.Length)
-            if ($read -gt 0) {
-                return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
-            }
+            try {
+                $buf = [byte[]]::new([Math]::Min($count, $fs.Length - $offset))
+                $fs.Position = $offset
+                $read = $fs.Read($buf, 0, $buf.Length)
+                if ($read -gt 0) {
+                    return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
+                }
+            } finally { $sha.Dispose() }
         } finally { $fs.Dispose() }
     } catch { return $null }
     return $null
@@ -585,7 +588,21 @@ function Get-FileHashValue([string]$path) {
         $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
         try {
             $sha = [System.Security.Cryptography.SHA256]::Create()
-            return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-','')
+            try {
+                $bufSize = 262144
+                $buf = [byte[]]::new($bufSize)
+                while ($true) {
+                    $read = $fs.Read($buf, 0, $bufSize)
+                    if ($read -eq 0) { break }
+                    if ($fs.Position -eq $fs.Length) {
+                        $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
+                    } else {
+                        $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
+                    }
+                }
+                if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
+                return [BitConverter]::ToString($sha.Hash).Replace('-','')
+            } finally { $sha.Dispose() }
         } finally { $fs.Dispose() }
     } catch { return $null }
 }
@@ -801,14 +818,16 @@ $controls.btnScan.Add_Click({
                 $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
                 try {
                     $sha = [System.Security.Cryptography.SHA256]::Create()
-                    $len = [Math]::Min($count, $fs.Length - $offset)
-                    if ($len -le 0) { return "" }
-                    $buf = [byte[]]::new($len)
-                    $fs.Position = $offset
-                    $read = $fs.Read($buf, 0, $buf.Length)
-                    if ($read -gt 0) {
-                        return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
-                    }
+                    try {
+                        $len = [Math]::Min($count, $fs.Length - $offset)
+                        if ($len -le 0) { return "" }
+                        $buf = [byte[]]::new($len)
+                        $fs.Position = $offset
+                        $read = $fs.Read($buf, 0, $buf.Length)
+                        if ($read -gt 0) {
+                            return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
+                        }
+                    } finally { $sha.Dispose() }
                 } finally { $fs.Dispose() }
             } catch { return $null }
             return $null
@@ -818,7 +837,21 @@ $controls.btnScan.Add_Click({
                 $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
                 try {
                     $sha = [System.Security.Cryptography.SHA256]::Create()
-                    return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-','')
+                    try {
+                        $bufSize = 262144
+                        $buf = [byte[]]::new($bufSize)
+                        while ($true) {
+                            $read = $fs.Read($buf, 0, $bufSize)
+                            if ($read -eq 0) { break }
+                            if ($fs.Position -eq $fs.Length) {
+                                $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
+                            } else {
+                                $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
+                            }
+                        }
+                        if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
+                        return [BitConverter]::ToString($sha.Hash).Replace('-','')
+                    } finally { $sha.Dispose() }
                 } finally { $fs.Dispose() }
             } catch { return $null }
         }
@@ -1057,11 +1090,15 @@ $controls.btnScan.Add_Click({
             $wastedBytes = 0L
             foreach ($kv in $verifiedGroups.GetEnumerator()) {
                 $groupNum++
+                $groupCount = $kv.Value.Count
+                $groupReclaimable = ($groupCount - 1) * $kv.Value[0].Size
+                $groupInfo = "$groupCount files, $(Format-FileSize $groupReclaimable) reclaimable"
                 $first = $true
                 foreach ($f in ($kv.Value | Sort-Object Modified -Descending)) {
                     $status = if ($f.IsRef) { "REF" } elseif ($first) { "Original" } else { "Duplicate" }
                     $sync.Results.Add([PSCustomObject]@{
                         Group     = $groupNum
+                        GroupInfo = $groupInfo
                         FileName  = $f.FileName
                         FullPath  = $f.FullPath
                         FolderPath = [System.IO.Path]::GetDirectoryName($f.FullPath)
@@ -1357,19 +1394,20 @@ $controls.btnDeleteSelected.Add_Click({
                 "Replace with Hardlinks" {
                     $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
                     if ($original -and [System.IO.File]::Exists($original.FullPath)) {
-                        # Cross-volume hardlink guard
                         $srcVol = Get-VolumeRoot $item.FullPath
                         $dstVol = Get-VolumeRoot $original.FullPath
                         if ($srcVol -ne $dstVol) {
                             $skippedCrossVol++
                             continue
                         }
-                        [System.IO.File]::Delete($item.FullPath)
-                        $hlResult = [Win32]::CreateHardLink($item.FullPath, $original.FullPath, [IntPtr]::Zero)
+                        $tempLink = $item.FullPath + ".dff_hardlink_tmp"
+                        $hlResult = [Win32]::CreateHardLink($tempLink, $original.FullPath, [IntPtr]::Zero)
                         if (-not $hlResult) {
                             $errors++
                             continue
                         }
+                        [System.IO.File]::Delete($item.FullPath)
+                        [System.IO.File]::Move($tempLink, $item.FullPath)
                     } else {
                         [System.IO.File]::Delete($item.FullPath)
                     }
@@ -1461,14 +1499,16 @@ else {
             $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
             try {
                 $sha = [System.Security.Cryptography.SHA256]::Create()
-                $len = [Math]::Min($count, $fs.Length - $offset)
-                if ($len -le 0) { return "" }
-                $buf = [byte[]]::new($len)
-                $fs.Position = $offset
-                $read = $fs.Read($buf, 0, $buf.Length)
-                if ($read -gt 0) {
-                    return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
-                }
+                try {
+                    $len = [Math]::Min($count, $fs.Length - $offset)
+                    if ($len -le 0) { return "" }
+                    $buf = [byte[]]::new($len)
+                    $fs.Position = $offset
+                    $read = $fs.Read($buf, 0, $buf.Length)
+                    if ($read -gt 0) {
+                        return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
+                    }
+                } finally { $sha.Dispose() }
             } finally { $fs.Dispose() }
         } catch { return $null }
         return $null
@@ -1479,7 +1519,21 @@ else {
             $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
             try {
                 $sha = [System.Security.Cryptography.SHA256]::Create()
-                return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-','')
+                try {
+                    $bufSize = 262144
+                    $buf = [byte[]]::new($bufSize)
+                    while ($true) {
+                        $read = $fs.Read($buf, 0, $bufSize)
+                        if ($read -eq 0) { break }
+                        if ($fs.Position -eq $fs.Length) {
+                            $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
+                        } else {
+                            $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
+                        }
+                    }
+                    if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
+                    return [BitConverter]::ToString($sha.Hash).Replace('-','')
+                } finally { $sha.Dispose() }
             } finally { $fs.Dispose() }
         } catch { return $null }
     }
@@ -1576,6 +1630,11 @@ else {
         $resolved = (Resolve-Path $sp -ErrorAction SilentlyContinue).Path
         if ($resolved) { $allScanPaths += $resolved }
         else { Write-Error "Scan folder not found: $sp"; exit 3 }
+    }
+
+    if ($Delete -and -not $AutoSelect) {
+        Write-Error "The -Delete parameter requires -AutoSelect to determine which files to keep. Example: -AutoSelect KeepNewest -Delete RecycleBin"
+        exit 1
     }
 
     if (-not $Silent) { Write-Host "DuplicateFF v1.1.0 - CLI Mode" }
@@ -1732,11 +1791,15 @@ else {
     $wastedBytes = 0L
     foreach ($kv in $verifiedGroups.GetEnumerator()) {
         $groupNum++
+        $groupCount = $kv.Value.Count
+        $groupReclaimable = ($groupCount - 1) * $kv.Value[0].Size
+        $groupInfo = "$groupCount files, $(Format-FileSize $groupReclaimable) reclaimable"
         $first = $true
         foreach ($f in ($kv.Value | Sort-Object Modified -Descending)) {
             $status = if ($f.IsRef) { "REF" } elseif ($first) { "Original" } else { "Duplicate" }
             $results.Add([PSCustomObject]@{
                 Group      = $groupNum
+                GroupInfo  = $groupInfo
                 FileName   = $f.FileName
                 FullPath   = $f.FullPath
                 FolderPath = [System.IO.Path]::GetDirectoryName($f.FullPath)
@@ -1834,9 +1897,11 @@ else {
                             $srcVol = Get-VolumeRoot $item.FullPath
                             $dstVol = Get-VolumeRoot $original.FullPath
                             if ($srcVol -ne $dstVol) { $skippedCrossVol++; continue }
-                            [System.IO.File]::Delete($item.FullPath)
-                            $hlResult = [Win32]::CreateHardLink($item.FullPath, $original.FullPath, [IntPtr]::Zero)
+                            $tempLink = $item.FullPath + ".dff_hardlink_tmp"
+                            $hlResult = [Win32]::CreateHardLink($tempLink, $original.FullPath, [IntPtr]::Zero)
                             if (-not $hlResult) { $errors++; continue }
+                            [System.IO.File]::Delete($item.FullPath)
+                            [System.IO.File]::Move($tempLink, $item.FullPath)
                         }
                     }
                 }
