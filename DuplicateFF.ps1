@@ -19,6 +19,8 @@ param(
     [string]$MinSize = 'No Minimum',
     [string]$MaxSize = 'No Maximum',
     [string[]]$Exclude,
+    [string]$IncludePattern,
+    [string]$ExcludePattern,
     [switch]$NoSubfolders,
     [switch]$IncludeZeroByte
 )
@@ -1786,6 +1788,8 @@ else {
                 }
             }
             if ($skipFile) { continue }
+            if ($IncludePattern -and $fi.Name -notmatch $IncludePattern) { continue }
+            if ($ExcludePattern -and $fi.Name -match $ExcludePattern) { continue }
             $isRef = $false
             foreach ($rp in $refPaths) {
                 if ($fi.FullName.StartsWith($rp, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -1820,6 +1824,8 @@ else {
                     }
                 }
                 if ($skipFile) { continue }
+                if ($IncludePattern -and $fi.Name -notmatch $IncludePattern) { continue }
+                if ($ExcludePattern -and $fi.Name -match $ExcludePattern) { continue }
                 $allFiles.Add([PSCustomObject]@{
                     FullPath = $fi.FullName; FileName = $fi.Name
                     Size = $fi.Length; Modified = $fi.LastWriteTime; IsRef = $true
