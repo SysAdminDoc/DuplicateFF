@@ -557,6 +557,20 @@ $script:Colors = @{
                             </Style.Triggers>
                         </Style>
                     </DataGrid.RowStyle>
+                    <DataGrid.ContextMenu>
+                        <ContextMenu Background="$($Colors.Surface0)" BorderBrush="$($Colors.Surface1)">
+                            <MenuItem x:Name="ctxOpenFile" Header="Open File" Foreground="$($Colors.Text)"/>
+                            <MenuItem x:Name="ctxOpenFolder" Header="Open Containing Folder" Foreground="$($Colors.Text)"/>
+                            <Separator/>
+                            <MenuItem x:Name="ctxCopyPath" Header="Copy Full Path" Foreground="$($Colors.Text)"/>
+                            <MenuItem x:Name="ctxCopyHash" Header="Copy Hash" Foreground="$($Colors.Text)"/>
+                            <Separator/>
+                            <MenuItem x:Name="ctxSelectGroup" Header="Select Entire Group" Foreground="$($Colors.Text)"/>
+                            <MenuItem x:Name="ctxDeselectGroup" Header="Deselect Entire Group" Foreground="$($Colors.Text)"/>
+                            <Separator/>
+                            <MenuItem x:Name="ctxSelectFolder" Header="Select All from This Folder" Foreground="$($Colors.Text)"/>
+                        </ContextMenu>
+                    </DataGrid.ContextMenu>
                     <DataGrid.Columns>
                         <DataGridCheckBoxColumn Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}" Width="35"
                                                 Header="" ElementStyle="{x:Null}"/>
@@ -674,7 +688,8 @@ $controls = @{}
   'chkSubfolders','chkZeroByte','btnScan','btnCancel','dgResults','imgPreview',
   'txtPreviewName','txtPreviewInfo','cmbAutoSelect','btnAutoSelect','btnSelectAll',
   'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnRehearse','btnDeleteSelected','btnExport',
-  'txtStatus','txtStats','prgScan') | ForEach-Object {
+  'txtStatus','txtStats','prgScan',
+  'ctxOpenFile','ctxOpenFolder','ctxCopyPath','ctxCopyHash','ctxSelectGroup','ctxDeselectGroup','ctxSelectFolder') | ForEach-Object {
     $controls[$_] = $window.FindName($_)
 }
 
@@ -792,6 +807,68 @@ $controls.dgResults.Add_MouseDoubleClick({
     $item = $controls.dgResults.SelectedItem
     if ($null -ne $item -and [System.IO.File]::Exists($item.FullPath)) {
         Start-Process explorer.exe -ArgumentList "/select,`"$($item.FullPath)`""
+    }
+})
+
+# --- Context Menu Handlers ---
+$controls.ctxOpenFile.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item -and [System.IO.File]::Exists($item.FullPath)) {
+        Start-Process $item.FullPath
+    }
+})
+$controls.ctxOpenFolder.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item -and [System.IO.File]::Exists($item.FullPath)) {
+        Start-Process explorer.exe -ArgumentList "/select,`"$($item.FullPath)`""
+    }
+})
+$controls.ctxCopyPath.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item) {
+        [System.Windows.Clipboard]::SetText($item.FullPath)
+        $controls.txtStatus.Text = "Copied path to clipboard"
+    }
+})
+$controls.ctxCopyHash.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item) {
+        [System.Windows.Clipboard]::SetText($item.Hash)
+        $controls.txtStatus.Text = "Copied hash to clipboard"
+    }
+})
+$controls.ctxSelectGroup.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item) {
+        foreach ($r in $script:Results) {
+            if ($r.Group -eq $item.Group -and -not $r.IsRef) { $r.Selected = $true }
+        }
+        $controls.dgResults.Items.Refresh()
+        $selectedCount = ($script:Results | Where-Object { $_.Selected }).Count
+        $controls.txtStatus.Text = "$selectedCount files selected"
+    }
+})
+$controls.ctxDeselectGroup.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item) {
+        foreach ($r in $script:Results) {
+            if ($r.Group -eq $item.Group) { $r.Selected = $false }
+        }
+        $controls.dgResults.Items.Refresh()
+        $selectedCount = ($script:Results | Where-Object { $_.Selected }).Count
+        $controls.txtStatus.Text = "$selectedCount files selected"
+    }
+})
+$controls.ctxSelectFolder.Add_Click({
+    $item = $controls.dgResults.SelectedItem
+    if ($null -ne $item) {
+        $folderPath = $item.FolderPath
+        foreach ($r in $script:Results) {
+            if ($r.FolderPath -eq $folderPath -and -not $r.IsRef) { $r.Selected = $true }
+        }
+        $controls.dgResults.Items.Refresh()
+        $selectedCount = ($script:Results | Where-Object { $_.Selected }).Count
+        $controls.txtStatus.Text = "$selectedCount files selected (from $folderPath)"
     }
 })
 
