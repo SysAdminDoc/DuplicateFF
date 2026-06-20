@@ -23,6 +23,7 @@ param(
     [string]$ExcludePattern,
     [datetime]$MinDate,
     [datetime]$MaxDate,
+    [switch]$FindUnique,
     [switch]$NoSubfolders,
     [switch]$IncludeZeroByte
 )
@@ -2014,6 +2015,70 @@ else {
     $fileIdMap = $null
     if ($hardlinkExcluded -gt 0 -and -not $Silent) {
         Write-Host "  Excluded $hardlinkExcluded hardlinked files"
+    }
+
+    # --- Find Unique Files mode (inverse of duplicate detection) ---
+    if ($FindUnique) {
+        if ($refPaths.Count -eq 0) {
+            Write-Error "The -FindUnique parameter requires -Reference folders to compare against."
+            exit 1
+        }
+        $scanFiles = @($allFiles | Where-Object { -not $_.IsRef })
+        $refFiles = @($allFiles | Where-Object { $_.IsRef })
+        if (-not $Silent) { Write-Host "Finding unique files: $($scanFiles.Count) scan vs $($refFiles.Count) reference" }
+
+        $refSizeSet = [System.Collections.Generic.HashSet[long]]::new()
+        foreach ($rf in $refFiles) { $refSizeSet.Add($rf.Size) | Out-Null }
+
+        $refHashSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $needHash = @($scanFiles | Where-Object { $refSizeSet.Contains($_.Size) })
+        $uniqueBySize = @($scanFiles | Where-Object { -not $refSizeSet.Contains($_.Size) })
+        if (-not $Silent) { Write-Host "  $($uniqueBySize.Count) unique by size alone" }
+
+        foreach ($rf in $refFiles) {
+            if ($refSizeSet.Contains($rf.Size)) {
+                $hash = Get-FileHashValue $rf.FullPath
+                if ($hash) { $refHashSet.Add($hash) | Out-Null }
+            }
+        }
+        $uniqueByHash = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($sf in $needHash) {
+            $hash = Get-FileHashValue $sf.FullPath
+            if ($null -eq $hash -or -not $refHashSet.Contains($hash)) {
+                $uniqueByHash.Add($sf)
+            }
+        }
+
+        $allUnique = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($f in $uniqueBySize) { $allUnique.Add($f) }
+        foreach ($f in $uniqueByHash) { $allUnique.Add($f) }
+
+        $cliStopwatch.Stop()
+        $cliElapsed = $cliStopwatch.Elapsed
+        $cliElapsedStr = if ($cliElapsed.TotalMinutes -ge 1) { "{0}m {1:D2}s" -f [int]$cliElapsed.TotalMinutes, $cliElapsed.Seconds } else { "{0:N1}s" -f $cliElapsed.TotalSeconds }
+        $uniqueSize = ($allUnique | Measure-Object -Property Size -Sum).Sum
+        if (-not $Silent) {
+            Write-Host "Found $($allUnique.Count) unique files ($(Format-FileSize $uniqueSize)) in $cliElapsedStr"
+        }
+        if ($Json) {
+            $allUnique | Select-Object FullPath, FileName, Size, @{N='SizeDisplay';E={Format-FileSize $_.Size}}, @{N='Modified';E={$_.Modified.ToString("yyyy-MM-dd HH:mm")}} | ConvertTo-Json -Depth 3
+        } elseif ($ReportPath) {
+            $sb = [System.Text.StringBuilder]::new()
+            $sb.AppendLine('"FileName","Size","SizeBytes","Modified","FullPath"') | Out-Null
+            foreach ($f in $allUnique) {
+                $fn = $f.FileName -replace '"','""'
+                $full = $f.FullPath -replace '"','""'
+                $sb.AppendLine("`"$fn`",`"$(Format-FileSize $f.Size)`",`"$($f.Size)`",`"$($f.Modified.ToString('yyyy-MM-dd HH:mm'))`",`"$full`"") | Out-Null
+            }
+            $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+            [System.IO.File]::WriteAllText($ReportPath, $sb.ToString(), $utf8Bom)
+            if (-not $Silent) { Write-Host "Report saved to $ReportPath" }
+        } elseif (-not $Silent) {
+            foreach ($f in ($allUnique | Sort-Object { $_.FullPath })) {
+                Write-Host "  [UNIQUE] $($f.FullPath)" -ForegroundColor Green
+            }
+        }
+        exit 0
     }
 
     # Phase 2: Size grouping
