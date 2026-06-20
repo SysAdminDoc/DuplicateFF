@@ -965,6 +965,7 @@ $controls.btnScan.Add_Click({
         DuplicateFiles = 0
         WastedSpace = 0L
         Results = [System.Collections.ArrayList]::new()
+        Errors = [System.Collections.ArrayList]::new()
         Done = $false
         Error = $null
     })
@@ -1148,7 +1149,10 @@ $controls.btnScan.Add_Click({
                             $sync.Status = "Enumerating... $($allFiles.Count) files found"
                         }
                     }
-                } catch { continue }
+                } catch {
+                    $sync.Errors.Add("Enumerate $($folder.Path): $($_.Exception.Message)") | Out-Null
+                    continue
+                }
             }
 
             if ($token.IsCancellationRequested) { return }
@@ -1380,7 +1384,9 @@ $controls.btnScan.Add_Click({
             if ($s.Error) {
                 $controls.txtStatus.Text = "Error: $($s.Error)"
             } else {
-                $controls.txtStats.Text = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted | $elapsedStr"
+                $statsText = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted | $elapsedStr"
+                if ($s.Errors.Count -gt 0) { $statsText += " | $($s.Errors.Count) errors" }
+                $controls.txtStats.Text = $statsText
 
                 # Toast notification when window is not active
                 if (-not $window.IsActive) {
