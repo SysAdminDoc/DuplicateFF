@@ -1,5 +1,6 @@
-# DuplicateFF v1.0.0
+# DuplicateFF v1.1.0
 
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-PowerShell-5391FE)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6)
