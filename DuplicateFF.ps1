@@ -52,6 +52,141 @@ if (-not $script:CLIMode) {
     [Win32]::ShowWindow([Win32]::GetConsoleWindow(), 0) | Out-Null
 }
 
+# --- Shared Helper Functions (used by both GUI and CLI) ---
+function Format-FileSize([long]$bytes) {
+    if ($bytes -lt 1KB) { return "$bytes B" }
+    if ($bytes -lt 1MB) { return "{0:N1} KB" -f ($bytes / 1KB) }
+    if ($bytes -lt 1GB) { return "{0:N1} MB" -f ($bytes / 1MB) }
+    return "{0:N2} GB" -f ($bytes / 1GB)
+}
+
+function Get-MinSizeBytes([string]$label) {
+    switch ($label) {
+        "1 KB"    { return 1KB }
+        "10 KB"   { return 10KB }
+        "100 KB"  { return 100KB }
+        "1 MB"    { return 1MB }
+        "10 MB"   { return 10MB }
+        "100 MB"  { return 100MB }
+        default   { return 0 }
+    }
+}
+
+function Get-MaxSizeBytes([string]$label) {
+    switch ($label) {
+        "10 MB"   { return 10MB }
+        "100 MB"  { return 100MB }
+        "500 MB"  { return 500MB }
+        "1 GB"    { return 1GB }
+        "5 GB"    { return 5GB }
+        "10 GB"   { return 10GB }
+        default   { return [long]::MaxValue }
+    }
+}
+
+function Get-PartialHash([string]$path, [long]$offset, [long]$count) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $buf = [byte[]]::new([Math]::Min($count, $fs.Length - $offset))
+                $fs.Position = $offset
+                $read = $fs.Read($buf, 0, $buf.Length)
+                if ($read -gt 0) {
+                    return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
+                }
+            } finally { $sha.Dispose() }
+        } finally { $fs.Dispose() }
+    } catch { return $null }
+    return $null
+}
+
+function Get-FileHashValue([string]$path) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $bufSize = 262144
+                $buf = [byte[]]::new($bufSize)
+                while ($true) {
+                    $read = $fs.Read($buf, 0, $bufSize)
+                    if ($read -eq 0) { break }
+                    if ($fs.Position -eq $fs.Length) {
+                        $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
+                    } else {
+                        $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
+                    }
+                }
+                if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
+                return [BitConverter]::ToString($sha.Hash).Replace('-','')
+            } finally { $sha.Dispose() }
+        } finally { $fs.Dispose() }
+    } catch { return $null }
+}
+
+function Test-ByteIdentical([string]$pathA, [string]$pathB) {
+    try {
+        $fsA = [System.IO.File]::Open($pathA, 'Open', 'Read', 'ReadWrite')
+        try {
+            $fsB = [System.IO.File]::Open($pathB, 'Open', 'Read', 'ReadWrite')
+            try {
+                if ($fsA.Length -ne $fsB.Length) { return $false }
+                $bufSize = 65536
+                $bufA = [byte[]]::new($bufSize)
+                $bufB = [byte[]]::new($bufSize)
+                while ($true) {
+                    $readA = $fsA.Read($bufA, 0, $bufSize)
+                    $readB = $fsB.Read($bufB, 0, $bufSize)
+                    if ($readA -ne $readB) { return $false }
+                    if ($readA -eq 0) { return $true }
+                    for ($i = 0; $i -lt $readA; $i++) {
+                        if ($bufA[$i] -ne $bufB[$i]) { return $false }
+                    }
+                }
+            } finally { $fsB.Dispose() }
+        } finally { $fsA.Dispose() }
+    } catch { return $false }
+}
+
+function Remove-ToRecycleBin([string]$path) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+        $path,
+        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+    )
+}
+
+function Get-VolumeRoot([string]$path) {
+    [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
+}
+
+function Test-FileLocked([string]$path) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+        $fs.Dispose()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Test-FileFilter([string]$ext, [string]$filter) {
+    switch ($filter) {
+        "Images Only"  { return $ext -in $script:ImageExts }
+        "Videos Only"  { return $ext -in $script:VideoExts }
+        "Audio Only"   { return $ext -in $script:AudioExts }
+        "Documents"    { return $ext -in $script:DocExts }
+        default        { return $true }
+    }
+}
+
+$script:ImageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.ico','.svg','.heic','.heif','.avif')
+$script:VideoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
+$script:AudioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
+$script:DocExts = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.rtf','.odt','.ods','.csv')
+
 # ===================================================================
 # GUI MODE
 # ===================================================================
@@ -548,125 +683,8 @@ $script:ScanFolders = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:Results = [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]]::new()
 $script:CancelSource = $null
 $script:IsScanning = $false
-$script:ImageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.ico','.svg','.heic','.heif','.avif')
-$script:VideoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
-$script:AudioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
-$script:DocExts = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.rtf','.odt','.ods','.csv')
 
 $controls.dgResults.ItemsSource = $script:Results
-
-# --- Helper: Format Size ---
-function Format-FileSize([long]$bytes) {
-    if ($bytes -lt 1KB) { return "$bytes B" }
-    if ($bytes -lt 1MB) { return "{0:N1} KB" -f ($bytes / 1KB) }
-    if ($bytes -lt 1GB) { return "{0:N1} MB" -f ($bytes / 1MB) }
-    return "{0:N2} GB" -f ($bytes / 1GB)
-}
-
-# --- Helper: Parse Size Label ---
-function Get-MinSizeBytes([string]$label) {
-    switch ($label) {
-        "1 KB"    { return 1KB }
-        "10 KB"   { return 10KB }
-        "100 KB"  { return 100KB }
-        "1 MB"    { return 1MB }
-        "10 MB"   { return 10MB }
-        "100 MB"  { return 100MB }
-        default   { return 0 }
-    }
-}
-
-function Get-MaxSizeBytes([string]$label) {
-    switch ($label) {
-        "10 MB"   { return 10MB }
-        "100 MB"  { return 100MB }
-        "500 MB"  { return 500MB }
-        "1 GB"    { return 1GB }
-        "5 GB"    { return 5GB }
-        "10 GB"   { return 10GB }
-        default   { return [long]::MaxValue }
-    }
-}
-
-# --- Helper: File Extension Filter ---
-function Test-FileFilter([string]$ext, [string]$filter) {
-    switch ($filter) {
-        "Images Only"  { return $ext -in $script:ImageExts }
-        "Videos Only"  { return $ext -in $script:VideoExts }
-        "Audio Only"   { return $ext -in $script:AudioExts }
-        "Documents"    { return $ext -in $script:DocExts }
-        default        { return $true }
-    }
-}
-
-# --- Helper: SHA256 of byte range ---
-function Get-PartialHash([string]$path, [long]$offset, [long]$count) {
-    try {
-        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-        try {
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            try {
-                $buf = [byte[]]::new([Math]::Min($count, $fs.Length - $offset))
-                $fs.Position = $offset
-                $read = $fs.Read($buf, 0, $buf.Length)
-                if ($read -gt 0) {
-                    return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
-                }
-            } finally { $sha.Dispose() }
-        } finally { $fs.Dispose() }
-    } catch { return $null }
-    return $null
-}
-
-# --- Helper: Full file SHA256 ---
-function Get-FileHashValue([string]$path) {
-    try {
-        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-        try {
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            try {
-                $bufSize = 262144
-                $buf = [byte[]]::new($bufSize)
-                while ($true) {
-                    $read = $fs.Read($buf, 0, $bufSize)
-                    if ($read -eq 0) { break }
-                    if ($fs.Position -eq $fs.Length) {
-                        $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
-                    } else {
-                        $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
-                    }
-                }
-                if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
-                return [BitConverter]::ToString($sha.Hash).Replace('-','')
-            } finally { $sha.Dispose() }
-        } finally { $fs.Dispose() }
-    } catch { return $null }
-}
-
-# --- Helper: Send to Recycle Bin ---
-function Remove-ToRecycleBin([string]$path) {
-    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-        $path,
-        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-    )
-}
-
-# --- Helper: Get volume root for cross-volume hardlink guard ---
-function Get-VolumeRoot([string]$path) {
-    [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
-}
-
-# --- Helper: Test if file is locked ---
-function Test-FileLocked([string]$path) {
-    try {
-        $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
-        $fs.Dispose()
-        return $false
-    } catch {
-        return $true
-    }
-}
 
 # --- Add Folder ---
 $controls.btnAddFolder.Add_Click({
@@ -1539,116 +1557,6 @@ $window.ShowDialog() | Out-Null
 # ===================================================================
 else {
 
-    # --- CLI Helper Functions (same as GUI but running in-process) ---
-    function Format-FileSize([long]$bytes) {
-        if ($bytes -lt 1KB) { return "$bytes B" }
-        if ($bytes -lt 1MB) { return "{0:N1} KB" -f ($bytes / 1KB) }
-        if ($bytes -lt 1GB) { return "{0:N1} MB" -f ($bytes / 1MB) }
-        return "{0:N2} GB" -f ($bytes / 1GB)
-    }
-
-    function Get-MinSizeBytes([string]$label) {
-        switch ($label) {
-            "1 KB"    { return 1KB }
-            "10 KB"   { return 10KB }
-            "100 KB"  { return 100KB }
-            "1 MB"    { return 1MB }
-            "10 MB"   { return 10MB }
-            "100 MB"  { return 100MB }
-            default   { return 0 }
-        }
-    }
-
-    function Get-PartialHash([string]$path, [long]$offset, [long]$count) {
-        try {
-            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-            try {
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try {
-                    $len = [Math]::Min($count, $fs.Length - $offset)
-                    if ($len -le 0) { return "" }
-                    $buf = [byte[]]::new($len)
-                    $fs.Position = $offset
-                    $read = $fs.Read($buf, 0, $buf.Length)
-                    if ($read -gt 0) {
-                        return [BitConverter]::ToString($sha.ComputeHash($buf, 0, $read)).Replace('-','')
-                    }
-                } finally { $sha.Dispose() }
-            } finally { $fs.Dispose() }
-        } catch { return $null }
-        return $null
-    }
-
-    function Get-FileHashValue([string]$path) {
-        try {
-            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-            try {
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try {
-                    $bufSize = 262144
-                    $buf = [byte[]]::new($bufSize)
-                    while ($true) {
-                        $read = $fs.Read($buf, 0, $bufSize)
-                        if ($read -eq 0) { break }
-                        if ($fs.Position -eq $fs.Length) {
-                            $sha.TransformFinalBlock($buf, 0, $read) | Out-Null
-                        } else {
-                            $sha.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
-                        }
-                    }
-                    if ($fs.Length -eq 0) { $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null }
-                    return [BitConverter]::ToString($sha.Hash).Replace('-','')
-                } finally { $sha.Dispose() }
-            } finally { $fs.Dispose() }
-        } catch { return $null }
-    }
-
-    function Test-ByteIdentical([string]$pathA, [string]$pathB) {
-        try {
-            $fsA = [System.IO.File]::Open($pathA, 'Open', 'Read', 'ReadWrite')
-            try {
-                $fsB = [System.IO.File]::Open($pathB, 'Open', 'Read', 'ReadWrite')
-                try {
-                    if ($fsA.Length -ne $fsB.Length) { return $false }
-                    $bufSize = 65536
-                    $bufA = [byte[]]::new($bufSize)
-                    $bufB = [byte[]]::new($bufSize)
-                    while ($true) {
-                        $readA = $fsA.Read($bufA, 0, $bufSize)
-                        $readB = $fsB.Read($bufB, 0, $bufSize)
-                        if ($readA -ne $readB) { return $false }
-                        if ($readA -eq 0) { return $true }
-                        for ($i = 0; $i -lt $readA; $i++) {
-                            if ($bufA[$i] -ne $bufB[$i]) { return $false }
-                        }
-                    }
-                } finally { $fsB.Dispose() }
-            } finally { $fsA.Dispose() }
-        } catch { return $false }
-    }
-
-    function Remove-ToRecycleBin([string]$path) {
-        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-            $path,
-            [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-            [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-        )
-    }
-
-    function Get-VolumeRoot([string]$path) {
-        [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
-    }
-
-    function Test-FileLocked([string]$path) {
-        try {
-            $fs = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
-            $fs.Dispose()
-            return $false
-        } catch {
-            return $true
-        }
-    }
-
     # Map CLI filter param to internal label
     $filterLabel = switch ($Filter) {
         'Images'    { "Images Only" }
@@ -1656,33 +1564,6 @@ else {
         'Audio'     { "Audio Only" }
         'Documents' { "Documents" }
         default     { "All Files" }
-    }
-
-    $imageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.ico','.svg','.heic','.heif','.avif')
-    $videoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
-    $audioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
-    $docExts   = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.rtf','.odt','.ods','.csv')
-
-    function Test-FileFilter([string]$ext, [string]$filter) {
-        switch ($filter) {
-            "Images Only"  { return $ext -in $imageExts }
-            "Videos Only"  { return $ext -in $videoExts }
-            "Audio Only"   { return $ext -in $audioExts }
-            "Documents"    { return $ext -in $docExts }
-            default        { return $true }
-        }
-    }
-
-    function Get-MaxSizeBytes([string]$label) {
-        switch ($label) {
-            "10 MB"   { return 10MB }
-            "100 MB"  { return 100MB }
-            "500 MB"  { return 500MB }
-            "1 GB"    { return 1GB }
-            "5 GB"    { return 5GB }
-            "10 GB"   { return 10GB }
-            default   { return [long]::MaxValue }
-        }
     }
 
     $recurse = -not $NoSubfolders
