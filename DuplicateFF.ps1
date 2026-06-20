@@ -503,7 +503,29 @@ $script:Colors = @{
 
             <!-- Results DataGrid -->
             <Border Grid.Column="0" Margin="8" Background="$($Colors.Mantle)" CornerRadius="8" Padding="1">
-                <DataGrid x:Name="dgResults" AutoGenerateColumns="False" IsReadOnly="False"
+              <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="8,6,8,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Filter:" FontSize="12" Foreground="$($Colors.Subtext1)"
+                               VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="txtFilter" Grid.Column="1" Background="$($Colors.Surface0)"
+                             Foreground="$($Colors.Text)" BorderBrush="$($Colors.Surface1)"
+                             Padding="6,4" FontSize="12" VerticalContentAlignment="Center"/>
+                    <Button x:Name="btnClearFilter" Grid.Column="2" Content="Clear" Style="{StaticResource BtnStyle}"
+                            Margin="4,0,0,0" Padding="8,4" FontSize="11"/>
+                    <TextBlock x:Name="txtFilterCount" Grid.Column="3" FontSize="11"
+                               Foreground="$($Colors.Overlay0)" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </Grid>
+                <DataGrid Grid.Row="1" x:Name="dgResults" AutoGenerateColumns="False" IsReadOnly="False"
                           Background="$($Colors.Mantle)" Foreground="$($Colors.Text)"
                           BorderThickness="0" GridLinesVisibility="Horizontal"
                           HorizontalGridLinesBrush="$($Colors.Surface0)"
@@ -583,6 +605,7 @@ $script:Colors = @{
                         <DataGridTextColumn Binding="{Binding Status}" Header="Status" Width="75"/>
                     </DataGrid.Columns>
                 </DataGrid>
+              </Grid>
             </Border>
 
             <GridSplitter Grid.Column="1" Width="4" Background="$($Colors.Surface0)"
@@ -689,7 +712,8 @@ $controls = @{}
   'txtPreviewName','txtPreviewInfo','cmbAutoSelect','btnAutoSelect','btnSelectAll',
   'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnRehearse','btnDeleteSelected','btnExport',
   'txtStatus','txtStats','prgScan',
-  'ctxOpenFile','ctxOpenFolder','ctxCopyPath','ctxCopyHash','ctxSelectGroup','ctxDeselectGroup','ctxSelectFolder') | ForEach-Object {
+  'ctxOpenFile','ctxOpenFolder','ctxCopyPath','ctxCopyHash','ctxSelectGroup','ctxDeselectGroup','ctxSelectFolder',
+  'txtFilter','btnClearFilter','txtFilterCount') | ForEach-Object {
     $controls[$_] = $window.FindName($_)
 }
 
@@ -872,6 +896,34 @@ $controls.ctxSelectFolder.Add_Click({
     }
 })
 
+# --- Filter Results ---
+$script:AllResults = $null
+$controls.txtFilter.Add_TextChanged({
+    $filterText = $controls.txtFilter.Text.Trim()
+    if ($script:Results.Count -eq 0) { return }
+    if (-not $script:AllResults) {
+        $script:AllResults = [System.Collections.Generic.List[PSCustomObject]]::new($script:Results)
+    }
+    $script:Results.Clear()
+    foreach ($r in $script:AllResults) {
+        if ([string]::IsNullOrEmpty($filterText) -or
+            $r.FileName.IndexOf($filterText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $r.FolderPath.IndexOf($filterText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $script:Results.Add($r)
+        }
+    }
+    $controls.txtFilterCount.Text = "$($script:Results.Count) / $($script:AllResults.Count)"
+})
+$controls.btnClearFilter.Add_Click({
+    $controls.txtFilter.Text = ""
+    if ($script:AllResults) {
+        $script:Results.Clear()
+        foreach ($r in $script:AllResults) { $script:Results.Add($r) }
+        $controls.txtFilterCount.Text = ""
+        $script:AllResults = $null
+    }
+})
+
 # --- SCAN ---
 $controls.btnScan.Add_Click({
     if ($script:ScanFolders.Count -eq 0) {
@@ -882,6 +934,9 @@ $controls.btnScan.Add_Click({
 
     $script:IsScanning = $true
     $script:Results.Clear()
+    $script:AllResults = $null
+    $controls.txtFilter.Text = ""
+    $controls.txtFilterCount.Text = ""
     $controls.btnScan.IsEnabled = $false
     $controls.btnCancel.IsEnabled = $true
     $controls.prgScan.Visibility = 'Visible'
