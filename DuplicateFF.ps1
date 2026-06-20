@@ -523,9 +523,11 @@ $script:Colors = @{
                     <CheckBox x:Name="chkZeroByte" Grid.Column="7" Content="Skip 0-byte" IsChecked="True"
                               Margin="16,0,0,0" VerticalAlignment="Center" FontSize="13"/>
                     <Button x:Name="btnScan" Grid.Column="9" Content="Scan for Duplicates" Style="{StaticResource AccentBtn}"
-                            Padding="20,7" FontSize="14" AutomationProperties.Name="Scan for duplicate files"/>
+                            Padding="20,7" FontSize="14" AutomationProperties.Name="Scan for duplicate files"
+                            IsDefault="True"/>
                     <Button x:Name="btnCancel" Grid.Column="10" Content="Cancel" Style="{StaticResource BtnStyle}"
-                            Margin="6,0,0,0" IsEnabled="False" AutomationProperties.Name="Cancel scan"/>
+                            Margin="6,0,0,0" IsEnabled="False" AutomationProperties.Name="Cancel scan"
+                            IsCancel="True"/>
                 </Grid>
             </Grid>
         </Border>
@@ -823,6 +825,17 @@ $window.Add_Drop({
         $controls.txtStatus.Text = "$($script:ScanFolders.Count) folders ready to scan"
     }
 })
+# --- Keyboard: Escape cancels scan ---
+$window.Add_KeyDown({
+    param($sender, $e)
+    if ($e.Key -eq 'Escape' -and $script:IsScanning -and $null -ne $script:CancelSource) {
+        $script:CancelSource.Cancel()
+        $controls.txtStatus.Text = "Cancelling..."
+        $controls.btnCancel.IsEnabled = $false
+        $e.Handled = $true
+    }
+})
+
 $window.Add_DragOver({
     param($sender, $e)
     if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
