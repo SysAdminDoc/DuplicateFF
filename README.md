@@ -23,8 +23,11 @@ Professional duplicate file finder with a progressive hashing pipeline for terab
 - **CSV Export** - RFC-compliant CSV with UTF-8 BOM for Excel compatibility
 - **Action Audit Log** - JSON log of every delete/hardlink operation with timestamps and hashes
 - **Async Scanning** - Non-blocking UI with elapsed time, scan statistics, and cancellation
-- **Dark Theme** - Catppuccin Mocha with screen reader accessibility
-- **Full CLI Mode** - Scriptable with -Scan, -Reference, -AutoSelect, -Delete, -Json, -DryRun, -MaxSize, -Exclude, -IncludePattern, -ExcludePattern
+- **NTFS Hardlink Detection** - Excludes same-inode files from results to avoid inflated counts
+- **Find Unique Files** - Inverse mode finds files in scan folders with no match in reference
+- **Duplicate Folders** - Detects entire directory trees that are identical copies
+- **Dark Theme** - Catppuccin Mocha with High Contrast support and screen reader accessibility
+- **Full CLI Mode** - Scriptable with -Scan, -Reference, -AutoSelect, -Delete, -Json, -DryRun, -MaxSize, -Exclude, -IncludePattern, -ExcludePattern, -MinDate, -MaxDate, -FindUnique, -FindDupeFolders
 
 ## Usage
 
@@ -48,6 +51,9 @@ Professional duplicate file finder with a progressive hashing pipeline for terab
 .\DuplicateFF.ps1 -Scan "D:\Photos" -Reference "D:\Archive" -AutoSelect KeepNewest -Delete RecycleBin
 .\DuplicateFF.ps1 -Scan "C:\Projects" -MaxSize "1 GB" -Exclude ".git","node_modules" -Json
 .\DuplicateFF.ps1 -Scan "D:\Media" -IncludePattern "\.(jpg|png|raw)$" -DryRun -Delete Permanent -AutoSelect KeepOldest
+.\DuplicateFF.ps1 -Scan "C:\Source" -Reference "D:\Backup" -FindUnique
+.\DuplicateFF.ps1 -Scan "D:\Data" -FindDupeFolders
+.\DuplicateFF.ps1 -Scan "D:\Photos" -MinDate "2024-01-01" -MaxDate "2024-12-31"
 ```
 
 ## How It Works
