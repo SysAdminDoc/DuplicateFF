@@ -24,6 +24,7 @@ param(
     [datetime]$MinDate,
     [datetime]$MaxDate,
     [switch]$FindUnique,
+    [switch]$FindDupeFolders,
     [switch]$NoSubfolders,
     [switch]$IncludeZeroByte
 )
@@ -2217,6 +2218,48 @@ else {
     if ($results.Count -eq 0) {
         if ($Json) { Write-Output "[]" }
         exit 0
+    }
+
+    # Duplicate folder detection
+    if ($FindDupeFolders) {
+        $folderHashes = @{}
+        foreach ($f in $allFiles) {
+            $dir = [System.IO.Path]::GetDirectoryName($f.FullPath)
+            if (-not $folderHashes.ContainsKey($dir)) {
+                $folderHashes[$dir] = [System.Collections.Generic.List[string]]::new()
+            }
+            $hash = Get-FileHashValue $f.FullPath
+            if ($hash) {
+                $rel = $f.FullPath.Substring($dir.Length)
+                $folderHashes[$dir].Add("$hash|$rel")
+            }
+        }
+        $folderSigs = @{}
+        foreach ($kv in $folderHashes.GetEnumerator()) {
+            $sig = ($kv.Value | Sort-Object) -join "`n"
+            if (-not $folderSigs.ContainsKey($sig)) {
+                $folderSigs[$sig] = [System.Collections.Generic.List[string]]::new()
+            }
+            $folderSigs[$sig].Add($kv.Key)
+        }
+        $dupeFolders = @($folderSigs.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 })
+        if ($dupeFolders.Count -gt 0) {
+            if (-not $Silent) {
+                Write-Host ""
+                Write-Host "=== Duplicate Folders ===" -ForegroundColor Cyan
+                $dfNum = 0
+                foreach ($df in $dupeFolders) {
+                    $dfNum++
+                    $fileCount = ($df.Key -split "`n").Count
+                    Write-Host "--- Folder Group $dfNum ($fileCount files each) ---" -ForegroundColor Cyan
+                    foreach ($dir in $df.Value) {
+                        Write-Host "  $dir" -ForegroundColor Yellow
+                    }
+                }
+            }
+        } elseif (-not $Silent) {
+            Write-Host "No duplicate folders found."
+        }
     }
 
     # Apply auto-select if specified
