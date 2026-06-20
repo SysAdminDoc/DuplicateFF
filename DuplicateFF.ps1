@@ -432,10 +432,13 @@ $script:Colors = @{
                     <ListBox x:Name="lstFolders" Grid.Column="1" Height="60" Background="$($Colors.Surface0)"
                              BorderBrush="$($Colors.Surface1)" BorderThickness="1"
                              ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
-                    <Button x:Name="btnAddFolder" Grid.Column="2" Content="Add Folder" Style="{StaticResource BtnStyle}" Margin="8,0,0,0"/>
+                    <Button x:Name="btnAddFolder" Grid.Column="2" Content="Add Folder" Style="{StaticResource BtnStyle}" Margin="8,0,0,0"
+                            AutomationProperties.Name="Add scan folder"/>
                     <Button x:Name="btnAddRef" Grid.Column="3" Content="Add Reference" Style="{StaticResource BtnStyle}" Margin="4,0,0,0"
-                            ToolTip="Reference folders are protected - duplicates will never be selected from these"/>
-                    <Button x:Name="btnRemoveFolder" Grid.Column="4" Content="Remove" Style="{StaticResource BtnStyle}" Margin="4,0,0,0"/>
+                            ToolTip="Reference folders are protected - duplicates will never be selected from these"
+                            AutomationProperties.Name="Add reference folder"/>
+                    <Button x:Name="btnRemoveFolder" Grid.Column="4" Content="Remove" Style="{StaticResource BtnStyle}" Margin="4,0,0,0"
+                            AutomationProperties.Name="Remove selected folder"/>
                 </Grid>
 
                 <!-- Scan Options -->
@@ -486,9 +489,9 @@ $script:Colors = @{
                     <CheckBox x:Name="chkZeroByte" Grid.Column="7" Content="Skip 0-byte" IsChecked="True"
                               Margin="16,0,0,0" VerticalAlignment="Center" FontSize="13"/>
                     <Button x:Name="btnScan" Grid.Column="9" Content="Scan for Duplicates" Style="{StaticResource AccentBtn}"
-                            Padding="20,7" FontSize="14"/>
+                            Padding="20,7" FontSize="14" AutomationProperties.Name="Scan for duplicate files"/>
                     <Button x:Name="btnCancel" Grid.Column="10" Content="Cancel" Style="{StaticResource BtnStyle}"
-                            Margin="6,0,0,0" IsEnabled="False"/>
+                            Margin="6,0,0,0" IsEnabled="False" AutomationProperties.Name="Cancel scan"/>
                 </Grid>
             </Grid>
         </Border>
@@ -672,7 +675,8 @@ $script:Colors = @{
                                 HorizontalAlignment="Stretch" Margin="0,0,0,4"
                                 ToolTip="Preview exactly what would be deleted without actually deleting anything"/>
                         <Button x:Name="btnDeleteSelected" Content="Delete Selected" Style="{StaticResource DangerBtn}"
-                                HorizontalAlignment="Stretch" Margin="0,0,0,4"/>
+                                HorizontalAlignment="Stretch" Margin="0,0,0,4"
+                                AutomationProperties.Name="Delete selected duplicate files"/>
                         <Button x:Name="btnExport" Content="Export Results (CSV)" Style="{StaticResource BtnStyle}"
                                 HorizontalAlignment="Stretch" Margin="0,0,0,0"/>
                     </StackPanel>
@@ -689,7 +693,8 @@ $script:Colors = @{
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="txtStatus" Grid.Column="0" Text="Ready - Add folders to begin scanning"
-                           FontSize="12" Foreground="$($Colors.Subtext0)" VerticalAlignment="Center"/>
+                           FontSize="12" Foreground="$($Colors.Subtext0)" VerticalAlignment="Center"
+                           AutomationProperties.LiveSetting="Polite"/>
                 <TextBlock x:Name="txtStats" Grid.Column="1" Text="" FontSize="12"
                            Foreground="$($Colors.Overlay0)" VerticalAlignment="Center" Margin="0,0,16,0"/>
                 <ProgressBar x:Name="prgScan" Grid.Column="2" Width="200" Height="14"
