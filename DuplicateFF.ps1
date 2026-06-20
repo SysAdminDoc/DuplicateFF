@@ -18,11 +18,17 @@ param(
     [string]$ReportPath,
     [string]$MinSize = 'No Minimum',
     [string]$MaxSize = 'No Maximum',
+    [string[]]$Exclude,
     [switch]$NoSubfolders,
     [switch]$IncludeZeroByte
 )
 
 $script:CLIMode = $Scan.Count -gt 0
+
+$script:DefaultExcludePatterns = @(
+    '$RECYCLE.BIN', 'System Volume Information', '.git', '.svn', '.hg',
+    'node_modules', '__pycache__', '.vs', '.idea', 'bin', 'obj'
+)
 
 if (-not $script:CLIMode) {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, Microsoft.VisualBasic
@@ -817,7 +823,7 @@ $controls.btnScan.Add_Click({
     $ps = [PowerShell]::Create()
     $ps.AddScript({
         param($folders, $recurse, $skipZero, $minSizeLabel, $maxSizeLabel, $filterLabel, $token, $sync,
-              $imageExts, $videoExts, $audioExts, $docExts)
+              $imageExts, $videoExts, $audioExts, $docExts, $excludePatterns)
 
         function Get-MinSizeBytes([string]$label) {
             switch ($label) {
@@ -965,6 +971,13 @@ $controls.btnScan.Add_Click({
                         if ($fi.Length -gt $maxSize) { continue }
                         $ext = $fi.Extension.ToLowerInvariant()
                         if (-not (Test-FileFilter $ext $filterLabel)) { continue }
+                        $skipFile = $false
+                        foreach ($ep in $excludePatterns) {
+                            if ($fi.FullName.IndexOf("\$ep\", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                                $skipFile = $true; break
+                            }
+                        }
+                        if ($skipFile) { continue }
 
                         # Determine if this file is under a reference folder
                         $isRef = $false
@@ -1176,7 +1189,8 @@ $controls.btnScan.Add_Click({
         }
     }).AddArgument($folders).AddArgument($recurse).AddArgument($skipZero).AddArgument($minSizeLabel
     ).AddArgument($maxSizeLabel).AddArgument($filterLabel).AddArgument($token).AddArgument($sync
-    ).AddArgument($script:ImageExts).AddArgument($script:VideoExts).AddArgument($script:AudioExts).AddArgument($script:DocExts)
+    ).AddArgument($script:ImageExts).AddArgument($script:VideoExts).AddArgument($script:AudioExts).AddArgument($script:DocExts
+    ).AddArgument($script:DefaultExcludePatterns)
 
     $handle = $ps.BeginInvoke()
 
@@ -1675,6 +1689,7 @@ else {
     $skipZero = -not $IncludeZeroByte
     $minSizeBytes = Get-MinSizeBytes $MinSize
     $maxSizeBytes = Get-MaxSizeBytes $MaxSize
+    $cliExcludePatterns = if ($Exclude) { $Exclude } else { $script:DefaultExcludePatterns }
 
     # Build folder list
     $refPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1723,6 +1738,13 @@ else {
             if ($fi.Length -gt $maxSizeBytes) { continue }
             $ext = $fi.Extension.ToLowerInvariant()
             if (-not (Test-FileFilter $ext $filterLabel)) { continue }
+            $skipFile = $false
+            foreach ($ep in $cliExcludePatterns) {
+                if ($fi.FullName.IndexOf("\$ep\", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $skipFile = $true; break
+                }
+            }
+            if ($skipFile) { continue }
             $isRef = $false
             foreach ($rp in $refPaths) {
                 if ($fi.FullName.StartsWith($rp, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -1750,6 +1772,13 @@ else {
                 if ($fi.Length -gt $maxSizeBytes) { continue }
                 $ext = $fi.Extension.ToLowerInvariant()
                 if (-not (Test-FileFilter $ext $filterLabel)) { continue }
+                $skipFile = $false
+                foreach ($ep in $cliExcludePatterns) {
+                    if ($fi.FullName.IndexOf("\$ep\", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $skipFile = $true; break
+                    }
+                }
+                if ($skipFile) { continue }
                 $allFiles.Add([PSCustomObject]@{
                     FullPath = $fi.FullName; FileName = $fi.Name
                     Size = $fi.Length; Modified = $fi.LastWriteTime; IsRef = $true
