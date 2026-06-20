@@ -226,15 +226,39 @@ $script:DocExts = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','
 # ===================================================================
 if (-not $script:CLIMode) {
 
-# --- Catppuccin Mocha Palette ---
-$script:Colors = @{
-    Base     = "#1E1E2E"; Mantle   = "#181825"; Crust    = "#11111B"
-    Surface0 = "#313244"; Surface1 = "#45475A"; Surface2 = "#585B70"
-    Text     = "#CDD6F4"; Subtext1 = "#BAC2DE"; Subtext0 = "#A6ADC8"
-    Overlay0 = "#6C7086"; Blue     = "#89B4FA"; Lavender = "#B4BEFE"
-    Green    = "#A6E3A1"; Red      = "#F38BA8"; Peach    = "#FAB387"
-    Yellow   = "#F9E2AF"; Mauve    = "#CBA6F7"; Teal     = "#94E2D5"
-    Sky      = "#89DCEB"; Pink     = "#F5C2E7"
+# --- Theme Palette ---
+$script:HighContrast = [System.Windows.SystemParameters]::HighContrast
+if ($script:HighContrast) {
+    $wc = [System.Windows.SystemColors]::WindowColor
+    $wfc = [System.Windows.SystemColors]::WindowTextColor
+    $hc = [System.Windows.SystemColors]::HighlightColor
+    $htc = [System.Windows.SystemColors]::HighlightTextColor
+    $cc = [System.Windows.SystemColors]::ControlColor
+    $toHex = { param($c) "#" + $c.R.ToString("X2") + $c.G.ToString("X2") + $c.B.ToString("X2") }
+    $bgHex = & $toHex $wc
+    $fgHex = & $toHex $wfc
+    $hlHex = & $toHex $hc
+    $htHex = & $toHex $htc
+    $ctlHex = & $toHex $cc
+    $script:Colors = @{
+        Base = $bgHex; Mantle = $bgHex; Crust = $bgHex
+        Surface0 = $ctlHex; Surface1 = $ctlHex; Surface2 = $ctlHex
+        Text = $fgHex; Subtext1 = $fgHex; Subtext0 = $fgHex
+        Overlay0 = $fgHex; Blue = $hlHex; Lavender = $hlHex
+        Green = $hlHex; Red = $hlHex; Peach = $fgHex
+        Yellow = $fgHex; Mauve = $hlHex; Teal = $fgHex
+        Sky = $fgHex; Pink = $fgHex
+    }
+} else {
+    $script:Colors = @{
+        Base     = "#1E1E2E"; Mantle   = "#181825"; Crust    = "#11111B"
+        Surface0 = "#313244"; Surface1 = "#45475A"; Surface2 = "#585B70"
+        Text     = "#CDD6F4"; Subtext1 = "#BAC2DE"; Subtext0 = "#A6ADC8"
+        Overlay0 = "#6C7086"; Blue     = "#89B4FA"; Lavender = "#B4BEFE"
+        Green    = "#A6E3A1"; Red      = "#F38BA8"; Peach    = "#FAB387"
+        Yellow   = "#F9E2AF"; Mauve    = "#CBA6F7"; Teal     = "#94E2D5"
+        Sky      = "#89DCEB"; Pink     = "#F5C2E7"
+    }
 }
 
 # --- XAML UI ---
