@@ -17,6 +17,7 @@ param(
     [switch]$Silent,
     [string]$ReportPath,
     [string]$MinSize = 'No Minimum',
+    [string]$MaxSize = 'No Maximum',
     [switch]$NoSubfolders,
     [switch]$IncludeZeroByte
 )
@@ -305,6 +306,8 @@ $script:Colors = @{
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
@@ -319,21 +322,31 @@ $script:Colors = @{
                         <ComboBoxItem Content="10 MB"/>
                         <ComboBoxItem Content="100 MB"/>
                     </ComboBox>
-                    <TextBlock Grid.Column="2" Text="  Filter:" VerticalAlignment="Center" Margin="10,0,6,0" FontSize="13"/>
-                    <ComboBox x:Name="cmbFilter" Grid.Column="3" Width="130" Style="{StaticResource ComboStyle}">
+                    <TextBlock Grid.Column="2" Text="Max:" VerticalAlignment="Center" Margin="10,0,6,0" FontSize="13"/>
+                    <ComboBox x:Name="cmbMaxSize" Grid.Column="3" Width="110" Style="{StaticResource ComboStyle}">
+                        <ComboBoxItem Content="No Maximum" IsSelected="True"/>
+                        <ComboBoxItem Content="10 MB"/>
+                        <ComboBoxItem Content="100 MB"/>
+                        <ComboBoxItem Content="500 MB"/>
+                        <ComboBoxItem Content="1 GB"/>
+                        <ComboBoxItem Content="5 GB"/>
+                        <ComboBoxItem Content="10 GB"/>
+                    </ComboBox>
+                    <TextBlock Grid.Column="4" Text="  Filter:" VerticalAlignment="Center" Margin="10,0,6,0" FontSize="13"/>
+                    <ComboBox x:Name="cmbFilter" Grid.Column="5" Width="130" Style="{StaticResource ComboStyle}">
                         <ComboBoxItem Content="All Files" IsSelected="True"/>
                         <ComboBoxItem Content="Images Only"/>
                         <ComboBoxItem Content="Videos Only"/>
                         <ComboBoxItem Content="Audio Only"/>
                         <ComboBoxItem Content="Documents"/>
                     </ComboBox>
-                    <CheckBox x:Name="chkSubfolders" Grid.Column="4" Content="Include Subfolders" IsChecked="True"
+                    <CheckBox x:Name="chkSubfolders" Grid.Column="6" Content="Include Subfolders" IsChecked="True"
                               Margin="16,0,0,0" VerticalAlignment="Center" FontSize="13"/>
-                    <CheckBox x:Name="chkZeroByte" Grid.Column="5" Content="Skip 0-byte" IsChecked="True"
+                    <CheckBox x:Name="chkZeroByte" Grid.Column="7" Content="Skip 0-byte" IsChecked="True"
                               Margin="16,0,0,0" VerticalAlignment="Center" FontSize="13"/>
-                    <Button x:Name="btnScan" Grid.Column="7" Content="Scan for Duplicates" Style="{StaticResource AccentBtn}"
+                    <Button x:Name="btnScan" Grid.Column="9" Content="Scan for Duplicates" Style="{StaticResource AccentBtn}"
                             Padding="20,7" FontSize="14"/>
-                    <Button x:Name="btnCancel" Grid.Column="8" Content="Cancel" Style="{StaticResource BtnStyle}"
+                    <Button x:Name="btnCancel" Grid.Column="10" Content="Cancel" Style="{StaticResource BtnStyle}"
                             Margin="6,0,0,0" IsEnabled="False"/>
                 </Grid>
             </Grid>
@@ -356,7 +369,12 @@ $script:Colors = @{
                           RowBackground="$($Colors.Mantle)" AlternatingRowBackground="$($Colors.Base)"
                           HeadersVisibility="Column" CanUserSortColumns="True"
                           SelectionMode="Extended" SelectionUnit="FullRow"
-                          CanUserResizeColumns="True" FontSize="12.5">
+                          CanUserResizeColumns="True" FontSize="12.5"
+                          VirtualizingStackPanel.IsVirtualizing="True"
+                          VirtualizingStackPanel.VirtualizationMode="Recycling"
+                          EnableRowVirtualization="True"
+                          EnableColumnVirtualization="True"
+                          ScrollViewer.IsDeferredScrollingEnabled="True">
                     <DataGrid.ColumnHeaderStyle>
                         <Style TargetType="DataGridColumnHeader">
                             <Setter Property="Background" Value="$($Colors.Surface0)"/>
@@ -511,7 +529,7 @@ $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # --- Get Controls ---
 $controls = @{}
-@('lstFolders','btnAddFolder','btnAddRef','btnRemoveFolder','cmbMinSize','cmbFilter',
+@('lstFolders','btnAddFolder','btnAddRef','btnRemoveFolder','cmbMinSize','cmbMaxSize','cmbFilter',
   'chkSubfolders','chkZeroByte','btnScan','btnCancel','dgResults','imgPreview',
   'txtPreviewName','txtPreviewInfo','cmbAutoSelect','btnAutoSelect','btnSelectAll',
   'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnRehearse','btnDeleteSelected','btnExport',
@@ -539,7 +557,7 @@ function Format-FileSize([long]$bytes) {
     return "{0:N2} GB" -f ($bytes / 1GB)
 }
 
-# --- Helper: Parse Min Size ---
+# --- Helper: Parse Size Label ---
 function Get-MinSizeBytes([string]$label) {
     switch ($label) {
         "1 KB"    { return 1KB }
@@ -549,6 +567,18 @@ function Get-MinSizeBytes([string]$label) {
         "10 MB"   { return 10MB }
         "100 MB"  { return 100MB }
         default   { return 0 }
+    }
+}
+
+function Get-MaxSizeBytes([string]$label) {
+    switch ($label) {
+        "10 MB"   { return 10MB }
+        "100 MB"  { return 100MB }
+        "500 MB"  { return 500MB }
+        "1 GB"    { return 1GB }
+        "5 GB"    { return 5GB }
+        "10 GB"   { return 10GB }
+        default   { return [long]::MaxValue }
     }
 }
 
@@ -759,12 +789,14 @@ $controls.btnScan.Add_Click({
     $controls.txtStats.Text = ""
 
     $script:CancelSource = [System.Threading.CancellationTokenSource]::new()
+    $script:ScanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $token = $script:CancelSource.Token
 
     $folders = $script:ScanFolders | ForEach-Object { [PSCustomObject]@{ Path = $_.Path; IsReference = $_.IsReference } }
     $recurse = $controls.chkSubfolders.IsChecked
     $skipZero = $controls.chkZeroByte.IsChecked
     $minSizeLabel = ($controls.cmbMinSize.SelectedItem).Content
+    $maxSizeLabel = ($controls.cmbMaxSize.SelectedItem).Content
     $filterLabel = ($controls.cmbFilter.SelectedItem).Content
 
     # Shared sync hashtable for progress reporting
@@ -784,7 +816,7 @@ $controls.btnScan.Add_Click({
     # Background worker
     $ps = [PowerShell]::Create()
     $ps.AddScript({
-        param($folders, $recurse, $skipZero, $minSizeLabel, $filterLabel, $token, $sync,
+        param($folders, $recurse, $skipZero, $minSizeLabel, $maxSizeLabel, $filterLabel, $token, $sync,
               $imageExts, $videoExts, $audioExts, $docExts)
 
         function Get-MinSizeBytes([string]$label) {
@@ -796,6 +828,17 @@ $controls.btnScan.Add_Click({
                 "10 MB"   { return 10485760 }
                 "100 MB"  { return 104857600 }
                 default   { return 0 }
+            }
+        }
+        function Get-MaxSizeBytes([string]$label) {
+            switch ($label) {
+                "10 MB"   { return 10485760 }
+                "100 MB"  { return 104857600 }
+                "500 MB"  { return 524288000 }
+                "1 GB"    { return 1073741824 }
+                "5 GB"    { return 5368709120 }
+                "10 GB"   { return 10737418240 }
+                default   { return [long]::MaxValue }
             }
         }
         function Test-FileFilter([string]$ext, [string]$filter) {
@@ -883,6 +926,7 @@ $controls.btnScan.Add_Click({
 
         try {
             $minSize = Get-MinSizeBytes $minSizeLabel
+            $maxSize = Get-MaxSizeBytes $maxSizeLabel
 
             # Phase 1: Enumerate files
             $sync.Status = "Enumerating files..."
@@ -918,6 +962,7 @@ $controls.btnScan.Add_Click({
                         if ($token.IsCancellationRequested) { return }
                         if ($skipZero -and $fi.Length -eq 0) { continue }
                         if ($fi.Length -lt $minSize) { continue }
+                        if ($fi.Length -gt $maxSize) { continue }
                         $ext = $fi.Extension.ToLowerInvariant()
                         if (-not (Test-FileFilter $ext $filterLabel)) { continue }
 
@@ -1130,7 +1175,7 @@ $controls.btnScan.Add_Click({
             $sync.Done = $true
         }
     }).AddArgument($folders).AddArgument($recurse).AddArgument($skipZero).AddArgument($minSizeLabel
-    ).AddArgument($filterLabel).AddArgument($token).AddArgument($sync
+    ).AddArgument($maxSizeLabel).AddArgument($filterLabel).AddArgument($token).AddArgument($sync
     ).AddArgument($script:ImageExts).AddArgument($script:VideoExts).AddArgument($script:AudioExts).AddArgument($script:DocExts)
 
     $handle = $ps.BeginInvoke()
@@ -1164,10 +1209,14 @@ $controls.btnScan.Add_Click({
             $controls.btnCancel.IsEnabled = $false
             $script:IsScanning = $false
 
+            $script:ScanStopwatch.Stop()
+            $elapsed = $script:ScanStopwatch.Elapsed
+            $elapsedStr = if ($elapsed.TotalMinutes -ge 1) { "{0}m {1:D2}s" -f [int]$elapsed.TotalMinutes, $elapsed.Seconds } else { "{0:N1}s" -f $elapsed.TotalSeconds }
+
             if ($s.Error) {
                 $controls.txtStatus.Text = "Error: $($s.Error)"
             } else {
-                $controls.txtStats.Text = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted"
+                $controls.txtStats.Text = "$($s.DuplicateGroups) groups | $($s.DuplicateFiles) duplicates | $(Format-FileSize $s.WastedSpace) wasted | $elapsedStr"
 
                 # Toast notification when window is not active
                 if (-not $window.IsActive) {
@@ -1453,14 +1502,16 @@ $controls.btnExport.Add_Click({
     }
     if ($dlg.ShowDialog() -eq 'OK') {
         $sb = [System.Text.StringBuilder]::new()
-        $sb.AppendLine("Group,Selected,Status,FileName,Size,SizeBytes,Modified,FolderPath,FullPath,Hash") | Out-Null
+        $sb.AppendLine('"Group","Selected","Status","FileName","Size","SizeBytes","Modified","FolderPath","FullPath","Hash"') | Out-Null
         foreach ($r in $script:Results) {
             $fn = $r.FileName -replace '"','""'
             $fp = $r.FolderPath -replace '"','""'
             $full = $r.FullPath -replace '"','""'
-            $sb.AppendLine("$($r.Group),$($r.Selected),$($r.Status),`"$fn`",$($r.SizeDisplay),$($r.Size),$($r.Modified),`"$fp`",`"$full`",$($r.Hash)") | Out-Null
+            $sd = $r.SizeDisplay -replace '"','""'
+            $sb.AppendLine("`"$($r.Group)`",`"$($r.Selected)`",`"$($r.Status)`",`"$fn`",`"$sd`",`"$($r.Size)`",`"$($r.Modified)`",`"$fp`",`"$full`",`"$($r.Hash)`"") | Out-Null
         }
-        [System.IO.File]::WriteAllText($dlg.FileName, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+        [System.IO.File]::WriteAllText($dlg.FileName, $sb.ToString(), $utf8Bom)
         $controls.txtStatus.Text = "Exported $($script:Results.Count) results to $($dlg.FileName)"
     }
 })
@@ -1608,9 +1659,22 @@ else {
         }
     }
 
+    function Get-MaxSizeBytes([string]$label) {
+        switch ($label) {
+            "10 MB"   { return 10MB }
+            "100 MB"  { return 100MB }
+            "500 MB"  { return 500MB }
+            "1 GB"    { return 1GB }
+            "5 GB"    { return 5GB }
+            "10 GB"   { return 10GB }
+            default   { return [long]::MaxValue }
+        }
+    }
+
     $recurse = -not $NoSubfolders
     $skipZero = -not $IncludeZeroByte
     $minSizeBytes = Get-MinSizeBytes $MinSize
+    $maxSizeBytes = Get-MaxSizeBytes $MaxSize
 
     # Build folder list
     $refPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1641,6 +1705,8 @@ else {
     if (-not $Silent) { Write-Host "Scanning: $($allScanPaths -join ', ')" }
     if ($refPaths.Count -gt 0 -and -not $Silent) { Write-Host "Reference: $($refPaths -join ', ')" }
 
+    $cliStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
     # Phase 1: Enumerate
     if (-not $Silent) { Write-Host "Phase 1: Enumerating files..." }
     $allFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -1654,6 +1720,7 @@ else {
         foreach ($fi in $di.EnumerateFiles('*', $enumOpts)) {
             if ($skipZero -and $fi.Length -eq 0) { continue }
             if ($fi.Length -lt $minSizeBytes) { continue }
+            if ($fi.Length -gt $maxSizeBytes) { continue }
             $ext = $fi.Extension.ToLowerInvariant()
             if (-not (Test-FileFilter $ext $filterLabel)) { continue }
             $isRef = $false
@@ -1680,6 +1747,7 @@ else {
             foreach ($fi in $di.EnumerateFiles('*', $enumOpts)) {
                 if ($skipZero -and $fi.Length -eq 0) { continue }
                 if ($fi.Length -lt $minSizeBytes) { continue }
+                if ($fi.Length -gt $maxSizeBytes) { continue }
                 $ext = $fi.Extension.ToLowerInvariant()
                 if (-not (Test-FileFilter $ext $filterLabel)) { continue }
                 $allFiles.Add([PSCustomObject]@{
@@ -1817,8 +1885,11 @@ else {
         }
     }
 
+    $cliStopwatch.Stop()
+    $cliElapsed = $cliStopwatch.Elapsed
+    $cliElapsedStr = if ($cliElapsed.TotalMinutes -ge 1) { "{0}m {1:D2}s" -f [int]$cliElapsed.TotalMinutes, $cliElapsed.Seconds } else { "{0:N1}s" -f $cliElapsed.TotalSeconds }
     if (-not $Silent) {
-        Write-Host "Found $groupNum duplicate groups ($dupFiles duplicate files, $(Format-FileSize $wastedBytes) wasted)"
+        Write-Host "Found $groupNum duplicate groups ($dupFiles duplicate files, $(Format-FileSize $wastedBytes) wasted) in $cliElapsedStr"
     }
 
     if ($results.Count -eq 0) {
@@ -1925,14 +1996,16 @@ else {
         $output | ConvertTo-Json -Depth 5
     } elseif ($ReportPath) {
         $sb = [System.Text.StringBuilder]::new()
-        $sb.AppendLine("Group,Selected,Status,FileName,Size,SizeBytes,Modified,FolderPath,FullPath,Hash") | Out-Null
+        $sb.AppendLine('"Group","Selected","Status","FileName","Size","SizeBytes","Modified","FolderPath","FullPath","Hash"') | Out-Null
         foreach ($r in $results) {
             $fn = $r.FileName -replace '"','""'
             $fp = $r.FolderPath -replace '"','""'
             $full = $r.FullPath -replace '"','""'
-            $sb.AppendLine("$($r.Group),$($r.Selected),$($r.Status),`"$fn`",$($r.SizeDisplay),$($r.Size),$($r.Modified),`"$fp`",`"$full`",$($r.Hash)") | Out-Null
+            $sd = $r.SizeDisplay -replace '"','""'
+            $sb.AppendLine("`"$($r.Group)`",`"$($r.Selected)`",`"$($r.Status)`",`"$fn`",`"$sd`",`"$($r.Size)`",`"$($r.Modified)`",`"$fp`",`"$full`",`"$($r.Hash)`"") | Out-Null
         }
-        [System.IO.File]::WriteAllText($ReportPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+        [System.IO.File]::WriteAllText($ReportPath, $sb.ToString(), $utf8Bom)
         if (-not $Silent) { Write-Host "Report saved to $ReportPath" }
     } elseif (-not $Silent -and -not $Delete) {
         # Default text output
