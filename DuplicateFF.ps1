@@ -1,4 +1,4 @@
-# DuplicateFF v1.1.0 - Professional Duplicate File Finder
+# DuplicateFF v1.2.0 - Professional Duplicate File Finder
 # PowerShell WPF | Catppuccin Mocha | Progressive Hashing Pipeline
 # MIT License - github.com/SysAdminDoc/DuplicateFF
 
@@ -8,14 +8,27 @@ param(
     [string[]]$Reference,
     [ValidateSet('All','Images','Videos','Audio','Documents')]
     [string]$Filter = 'All',
-    [ValidateSet('KeepNewest','KeepOldest','KeepReference','KeepLargest','KeepShortestPath')]
+    [ValidateSet('KeepNewest','KeepOldest','KeepReference','KeepLargest','KeepShortestPath','RuleChain')]
     [string]$AutoSelect,
+    [string]$AutoSelectChain = "reference,newest,shortestpath",
+    [string[]]$SelectPattern,
+    [string[]]$KnownHash,
+    [string]$KnownHashPath,
+    [int]$WorkerCount = 0,
+    [switch]$NeverDeleteNetwork,
     [ValidateSet('RecycleBin','Permanent','Hardlink')]
     [string]$Delete,
     [switch]$Json,
     [switch]$DryRun,
     [switch]$Silent,
     [string]$ReportPath,
+    [ValidateSet('Auto','Csv','Html','Markdown')]
+    [string]$ReportFormat = 'Auto',
+    [string]$PackagePath,
+    [switch]$InstallSchedule,
+    [string]$ScheduleName = 'DuplicateFF Scheduled Scan',
+    [string]$ScheduleInbox,
+    [string]$MavenSortPath,
     [string]$MinSize = 'No Minimum',
     [string]$MaxSize = 'No Maximum',
     [string[]]$Exclude,
@@ -29,7 +42,9 @@ param(
     [switch]$IncludeZeroByte
 )
 
-$script:CLIMode = $Scan.Count -gt 0
+$script:AppVersion = '1.2.0'
+$script:CLIMode = $Scan.Count -gt 0 -or [bool]$PackagePath -or [bool]$InstallSchedule
+$script:MemoryMapThresholdBytes = 128MB
 
 $script:DefaultExcludePatterns = @(
     '$RECYCLE.BIN', 'System Volume Information', '.git', '.svn', '.hg',
@@ -131,6 +146,17 @@ function Get-FileHashValue([string]$path) {
         try {
             $sha = [System.Security.Cryptography.SHA256]::Create()
             try {
+                if ($fs.Length -ge $script:MemoryMapThresholdBytes) {
+                    $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
+                        $fs, $null, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read,
+                        [System.IO.HandleInheritability]::None, $true)
+                    try {
+                        $view = $mmf.CreateViewStream(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+                        try {
+                            return [BitConverter]::ToString($sha.ComputeHash($view)).Replace('-','')
+                        } finally { $view.Dispose() }
+                    } finally { $mmf.Dispose() }
+                }
                 $bufSize = 262144
                 $buf = [byte[]]::new($bufSize)
                 while ($true) {
@@ -218,6 +244,279 @@ function Test-FileFilter([string]$ext, [string]$filter) {
     }
 }
 
+function Get-DefaultWorkerCount([int]$requested = 0) {
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    $diskBoundDefault = [Math]::Min(4, $cores)
+    if ($requested -gt 0) {
+        return [Math]::Max(1, [Math]::Min($requested, $cores))
+    }
+    return $diskBoundDefault
+}
+
+function Get-KnownHashSet([string[]]$HashValues, [string]$HashPath) {
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    if ($HashValues) {
+        foreach ($value in $HashValues) {
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            foreach ($part in ($value -split '[\s,;]+')) {
+                if (-not [string]::IsNullOrWhiteSpace($part)) { $tokens.Add($part) }
+            }
+        }
+    }
+    if ($HashPath -and [System.IO.File]::Exists($HashPath)) {
+        foreach ($line in [System.IO.File]::ReadAllLines($HashPath)) {
+            foreach ($part in ($line -split '[\s,;]+')) {
+                if (-not [string]::IsNullOrWhiteSpace($part)) { $tokens.Add($part) }
+            }
+        }
+    }
+    foreach ($token in $tokens) {
+        $clean = ($token.Trim() -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+        if ($clean.Length -ge 32) { $set.Add($clean) | Out-Null }
+    }
+    return $set
+}
+
+function Test-NetworkPath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    if ($path.StartsWith('\\')) { return $true }
+    try {
+        $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($path))
+        if ([string]::IsNullOrWhiteSpace($root)) { return $false }
+        $drive = [System.IO.DriveInfo]::new($root)
+        return $drive.DriveType -eq [System.IO.DriveType]::Network
+    } catch {
+        return $false
+    }
+}
+
+function ConvertTo-CsvField([object]$value) {
+    $text = if ($null -eq $value) { "" } else { [string]$value }
+    return '"' + ($text -replace '"','""') + '"'
+}
+
+function Get-ReportFormatFromPath([string]$path, [string]$requestedFormat) {
+    if ($requestedFormat -and $requestedFormat -ne 'Auto') { return $requestedFormat }
+    $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
+    switch ($ext) {
+        '.html' { return 'Html' }
+        '.htm'  { return 'Html' }
+        '.md'   { return 'Markdown' }
+        default { return 'Csv' }
+    }
+}
+
+function Write-DuplicateReport([System.Collections.IEnumerable]$Rows, [string]$Path, [string]$Format = 'Auto') {
+    $rowsArray = @($Rows)
+    $resolvedFormat = Get-ReportFormatFromPath $Path $Format
+    $dir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Path))
+    if ($dir -and -not [System.IO.Directory]::Exists($dir)) {
+        [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    }
+
+    if ($resolvedFormat -eq 'Html') {
+        $sb = [System.Text.StringBuilder]::new()
+        $sb.AppendLine('<!doctype html><html><head><meta charset="utf-8"><title>DuplicateFF Report</title>') | Out-Null
+        $sb.AppendLine('<style>body{font-family:Segoe UI,Arial,sans-serif;background:#11111b;color:#cdd6f4;margin:24px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #313244;padding:8px;text-align:left;vertical-align:top}th{color:#89b4fa}img{max-width:96px;max-height:72px;border-radius:4px}.status-ref{color:#a6e3a1}.status-dup{color:#f9e2af}</style>') | Out-Null
+        $sb.AppendLine('</head><body>') | Out-Null
+        $total = ($rowsArray | Measure-Object -Property Size -Sum).Sum
+        $sb.AppendLine("<h1>DuplicateFF Report</h1><p>$($rowsArray.Count) rows, $(Format-FileSize ([long]$total)) listed.</p>") | Out-Null
+        $sb.AppendLine('<table><thead><tr><th>Preview</th><th>Group</th><th>Status</th><th>Name</th><th>Size</th><th>Modified</th><th>Path</th><th>Hash</th></tr></thead><tbody>') | Out-Null
+        foreach ($r in $rowsArray) {
+            $preview = ''
+            $ext = [System.IO.Path]::GetExtension($r.FullPath).ToLowerInvariant()
+            if ($ext -in @('.jpg','.jpeg','.png','.gif','.bmp','.webp','.ico') -and [System.IO.File]::Exists($r.FullPath)) {
+                try {
+                    $fi = [System.IO.FileInfo]::new($r.FullPath)
+                    if ($fi.Length -le 2MB) {
+                        $bytes = [System.IO.File]::ReadAllBytes($r.FullPath)
+                        $mime = switch ($ext) {
+                            '.jpg'  { 'image/jpeg' }
+                            '.jpeg' { 'image/jpeg' }
+                            '.png'  { 'image/png' }
+                            '.gif'  { 'image/gif' }
+                            '.bmp'  { 'image/bmp' }
+                            '.webp' { 'image/webp' }
+                            default { 'image/x-icon' }
+                        }
+                        $preview = "<img alt=`"preview`" src=`"data:$mime;base64,$([Convert]::ToBase64String($bytes))`">"
+                    }
+                } catch { $preview = '' }
+            }
+            $statusClass = if ($r.Status -eq 'REF') { 'status-ref' } elseif ($r.Status -eq 'Duplicate') { 'status-dup' } else { '' }
+            $sb.AppendLine('<tr>' +
+                "<td>$preview</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.Group))</td>" +
+                "<td class=`"$statusClass`">$([System.Net.WebUtility]::HtmlEncode([string]$r.Status))</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.FileName))</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.SizeDisplay))</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.Modified))</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.FullPath))</td>" +
+                "<td>$([System.Net.WebUtility]::HtmlEncode([string]$r.Hash))</td>" +
+                '</tr>') | Out-Null
+        }
+        $sb.AppendLine('</tbody></table></body></html>') | Out-Null
+        [System.IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.UTF8Encoding]::new($true))
+        return
+    }
+
+    if ($resolvedFormat -eq 'Markdown') {
+        $sb = [System.Text.StringBuilder]::new()
+        $sb.AppendLine("# DuplicateFF Report") | Out-Null
+        $sb.AppendLine("") | Out-Null
+        $sb.AppendLine("| Group | Status | File | Size | Modified | Path | Hash |") | Out-Null
+        $sb.AppendLine("|---:|---|---|---:|---|---|---|") | Out-Null
+        foreach ($r in $rowsArray) {
+            $fileName = ([string]$r.FileName) -replace '\|','\|'
+            $fullPath = ([string]$r.FullPath) -replace '\|','\|'
+            $sb.AppendLine("| $($r.Group) | $($r.Status) | $fileName | $($r.SizeDisplay) | $($r.Modified) | $fullPath | $($r.Hash) |") | Out-Null
+        }
+        [System.IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.UTF8Encoding]::new($true))
+        return
+    }
+
+    $csv = [System.Text.StringBuilder]::new()
+    $csv.AppendLine('"Group","GroupInfo","Selected","Status","FileName","Size","SizeBytes","Modified","FolderPath","FullPath","Hash"') | Out-Null
+    foreach ($r in $rowsArray) {
+        $fields = @($r.Group, $r.GroupInfo, $r.Selected, $r.Status, $r.FileName, $r.SizeDisplay, $r.Size, $r.Modified, $r.FolderPath, $r.FullPath, $r.Hash)
+        $csv.AppendLine(($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ',') | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $csv.ToString(), [System.Text.UTF8Encoding]::new($true))
+}
+
+function Get-KeepItemByRuleChain([System.Collections.IEnumerable]$Items, [string]$RuleChain) {
+    $remaining = @($Items)
+    if ($remaining.Count -eq 0) { return $null }
+    $rules = @($RuleChain -split '[,>+]+' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    if ($rules.Count -eq 0) { $rules = @('reference','newest','shortestpath') }
+    foreach ($rule in $rules) {
+        if ($remaining.Count -le 1) { break }
+        switch ($rule) {
+            { $_ -in @('reference','ref','keepreference') } {
+                $refs = @($remaining | Where-Object { $_.IsRef })
+                if ($refs.Count -gt 0) { $remaining = $refs }
+            }
+            { $_ -in @('newest','keepnewest') } {
+                $best = ($remaining | Measure-Object -Property ModifiedDt -Maximum).Maximum
+                $remaining = @($remaining | Where-Object { $_.ModifiedDt -eq $best })
+            }
+            { $_ -in @('oldest','keepoldest') } {
+                $best = ($remaining | Measure-Object -Property ModifiedDt -Minimum).Minimum
+                $remaining = @($remaining | Where-Object { $_.ModifiedDt -eq $best })
+            }
+            { $_ -in @('largest','keeplargest') } {
+                $best = ($remaining | Measure-Object -Property Size -Maximum).Maximum
+                $remaining = @($remaining | Where-Object { $_.Size -eq $best })
+            }
+            { $_ -in @('shortestpath','shortest','keepshortestpath') } {
+                $min = ($remaining | ForEach-Object { $_.FullPath.Length } | Measure-Object -Minimum).Minimum
+                $remaining = @($remaining | Where-Object { $_.FullPath.Length -eq $min })
+            }
+            { $_ -in @('longestpath','longest') } {
+                $max = ($remaining | ForEach-Object { $_.FullPath.Length } | Measure-Object -Maximum).Maximum
+                $remaining = @($remaining | Where-Object { $_.FullPath.Length -eq $max })
+            }
+        }
+    }
+    return ($remaining | Sort-Object FullPath | Select-Object -First 1)
+}
+
+function Select-DuplicateResults([System.Collections.IEnumerable]$Rows, [string]$Mode, [string]$RuleChain, [string[]]$Patterns) {
+    $rowsArray = @($Rows)
+    foreach ($r in $rowsArray) { $r.Selected = $false }
+    $groups = @{}
+    foreach ($r in $rowsArray) {
+        if (-not $groups.ContainsKey($r.Group)) {
+            $groups[$r.Group] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $groups[$r.Group].Add($r)
+    }
+    foreach ($kv in $groups.GetEnumerator()) {
+        $items = $kv.Value
+        $chain = switch ($Mode) {
+            'KeepNewest'       { 'newest,reference,shortestpath' }
+            'KeepOldest'       { 'oldest,reference,shortestpath' }
+            'KeepReference'    { 'reference,newest,shortestpath' }
+            'KeepLargest'      { 'largest,reference,newest,shortestpath' }
+            'KeepShortestPath' { 'shortestpath,reference,newest' }
+            'RuleChain'        { $RuleChain }
+            default            { $RuleChain }
+        }
+        if ($Mode -or $RuleChain) {
+            $keepItem = Get-KeepItemByRuleChain $items $chain
+            foreach ($i in $items) {
+                if ($i.IsRef) { $i.Selected = $false; continue }
+                $i.Selected = ($null -ne $keepItem -and $i.FullPath -ne $keepItem.FullPath)
+            }
+        }
+    }
+    if ($Patterns) {
+        foreach ($r in $rowsArray) {
+            if ($r.IsRef) { continue }
+            foreach ($pattern in $Patterns) {
+                if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
+                try {
+                    if ($r.FullPath -match $pattern) { $r.Selected = $true; break }
+                } catch { }
+            }
+        }
+    }
+}
+
+function New-PortablePackage([string]$DestinationPath) {
+    $root = Split-Path -Parent $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = (Get-Location).Path }
+    if ([string]::IsNullOrWhiteSpace($DestinationPath)) {
+        $DestinationPath = [System.IO.Path]::Combine($root, 'dist', "DuplicateFF-v$($script:AppVersion).zip")
+    }
+    if (-not [System.IO.Path]::IsPathRooted($DestinationPath)) {
+        $DestinationPath = [System.IO.Path]::Combine($root, $DestinationPath)
+    }
+    $destDir = [System.IO.Path]::GetDirectoryName($DestinationPath)
+    if ($destDir -and -not [System.IO.Directory]::Exists($destDir)) {
+        [System.IO.Directory]::CreateDirectory($destDir) | Out-Null
+    }
+    if ([System.IO.File]::Exists($DestinationPath)) { [System.IO.File]::Delete($DestinationPath) }
+    $items = @('DuplicateFF.ps1','README.md','LICENSE','screenshot.png') | ForEach-Object {
+        [System.IO.Path]::Combine($root, $_)
+    } | Where-Object { [System.IO.File]::Exists($_) }
+    Compress-Archive -Path $items -DestinationPath $DestinationPath -Force
+    return $DestinationPath
+}
+
+function Install-DuplicateFFSchedule([string[]]$ScanPaths, [string[]]$ReferencePaths, [string]$TaskName, [string]$InboxPath) {
+    if (-not $ScanPaths -or $ScanPaths.Count -eq 0) {
+        throw "Schedule installation requires -Scan."
+    }
+    $root = Split-Path -Parent $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($InboxPath)) {
+        $InboxPath = [System.IO.Path]::Combine($root, 'scheduled-results')
+    }
+    if (-not [System.IO.Directory]::Exists($InboxPath)) {
+        [System.IO.Directory]::CreateDirectory($InboxPath) | Out-Null
+    }
+    $report = [System.IO.Path]::Combine($InboxPath, 'DuplicateFF_scheduled.csv')
+    $scanArgs = ($ScanPaths | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' }) -join ','
+    $refArg = ''
+    if ($ReferencePaths -and $ReferencePaths.Count -gt 0) {
+        $refArg = ' -Reference ' + (($ReferencePaths | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' }) -join ',')
+    }
+    $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Scan $scanArgs$refArg -ReportPath `"$report`" -Silent"
+    $args = @('/Create','/SC','DAILY','/ST','02:00','/TN',$TaskName,'/TR',$tr,'/F')
+    $proc = Start-Process -FilePath schtasks.exe -ArgumentList $args -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { throw "schtasks.exe failed with exit code $($proc.ExitCode)" }
+    return $InboxPath
+}
+
+function Invoke-PostScanOrganizer([string]$OrganizerPath, [string[]]$ScanPaths) {
+    if ([string]::IsNullOrWhiteSpace($OrganizerPath)) { return }
+    if (-not [System.IO.File]::Exists($OrganizerPath)) { throw "Organizer not found: $OrganizerPath" }
+    foreach ($path in $ScanPaths) {
+        Start-Process -FilePath $OrganizerPath -ArgumentList @($path) -Wait -NoNewWindow
+    }
+}
+
 $script:ImageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.ico','.svg','.heic','.heif','.avif')
 $script:VideoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
 $script:AudioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
@@ -267,7 +566,7 @@ if ($script:HighContrast) {
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DuplicateFF v1.1.0" Width="1280" Height="820" MinWidth="900" MinHeight="650"
+        Title="DuplicateFF v1.2.0" Width="1320" Height="900" MinWidth="960" MinHeight="720"
         WindowStartupLocation="CenterScreen" Background="$($Colors.Base)"
         AllowDrop="True">
     <Window.Resources>
@@ -476,6 +775,7 @@ if ($script:HighContrast) {
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <!-- Folder Controls -->
@@ -554,6 +854,34 @@ if ($script:HighContrast) {
                     <Button x:Name="btnCancel" Grid.Column="10" Content="Cancel" Style="{StaticResource BtnStyle}"
                             Margin="6,0,0,0" IsEnabled="False" AutomationProperties.Name="Cancel scan"
                             IsCancel="True"/>
+                </Grid>
+
+                <!-- Advanced Scan Options -->
+                <Grid Grid.Row="2" Margin="0,8,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="2*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="80"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Known Hashes:" VerticalAlignment="Center" Margin="0,0,6,0" FontSize="12"
+                               Foreground="$($Colors.Subtext1)"/>
+                    <TextBox x:Name="txtKnownHashes" Grid.Column="1" Background="$($Colors.Surface0)"
+                             Foreground="$($Colors.Text)" BorderBrush="$($Colors.Surface1)" Padding="6,4"
+                             FontSize="12" VerticalContentAlignment="Center"
+                             ToolTip="Paste SHA hashes separated by spaces, commas, or new lines. Matching content will never be flagged."/>
+                    <TextBlock Grid.Column="2" Text="Workers:" VerticalAlignment="Center" Margin="12,0,6,0" FontSize="12"
+                               Foreground="$($Colors.Subtext1)"/>
+                    <ComboBox x:Name="cmbWorkers" Grid.Column="3" Style="{StaticResource ComboStyle}">
+                        <ComboBoxItem Content="Auto" IsSelected="True"/>
+                        <ComboBoxItem Content="1"/>
+                        <ComboBoxItem Content="2"/>
+                        <ComboBoxItem Content="4"/>
+                        <ComboBoxItem Content="8"/>
+                    </ComboBox>
+                    <CheckBox x:Name="chkNeverDeleteNetwork" Grid.Column="4" Content="Never delete network paths"
+                              IsChecked="True" Margin="14,0,0,0" VerticalAlignment="Center" FontSize="12"/>
                 </Grid>
             </Grid>
         </Border>
@@ -679,12 +1007,28 @@ if ($script:HighContrast) {
             <!-- Preview + Actions Panel -->
             <Grid Grid.Column="2">
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="180"/>
                     <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <!-- Preview -->
+                <!-- Group Browser -->
                 <Border Grid.Row="0" Margin="4,8,8,4" Background="$($Colors.Mantle)" CornerRadius="8" Padding="10">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Text="Groups" FontSize="13" FontWeight="SemiBold"
+                                   Foreground="$($Colors.Blue)" Margin="0,0,0,8"/>
+                        <TreeView x:Name="tvGroups" Grid.Row="1" Background="$($Colors.Surface0)"
+                                  Foreground="$($Colors.Text)" BorderBrush="$($Colors.Surface1)"
+                                  BorderThickness="1" FontSize="12"/>
+                    </Grid>
+                </Border>
+
+                <!-- Preview -->
+                <Border Grid.Row="1" Margin="4,4,8,4" Background="$($Colors.Mantle)" CornerRadius="8" Padding="10">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -705,7 +1049,7 @@ if ($script:HighContrast) {
                 </Border>
 
                 <!-- Actions -->
-                <Border Grid.Row="1" Margin="4,4,8,8" Background="$($Colors.Mantle)" CornerRadius="8" Padding="10">
+                <Border Grid.Row="2" Margin="4,4,8,8" Background="$($Colors.Mantle)" CornerRadius="8" Padding="10">
                     <StackPanel>
                         <TextBlock Text="Actions" FontSize="13" FontWeight="SemiBold"
                                    Foreground="$($Colors.Blue)" Margin="0,0,0,8"/>
@@ -717,7 +1061,29 @@ if ($script:HighContrast) {
                             <ComboBoxItem Content="Keep from Reference Folders"/>
                             <ComboBoxItem Content="Keep Largest"/>
                             <ComboBoxItem Content="Keep Shortest Path"/>
+                            <ComboBoxItem Content="Rule Chain"/>
                         </ComboBox>
+                        <TextBox x:Name="txtRuleChain" Text="reference,newest,shortestpath"
+                                 Background="$($Colors.Surface0)" Foreground="$($Colors.Text)"
+                                 BorderBrush="$($Colors.Surface1)" Padding="6,4" FontSize="12"
+                                 Margin="0,0,0,6"
+                                 ToolTip="Comma-separated keep rules: reference, newest, oldest, largest, shortestpath"/>
+                        <TextBlock Text="Saved Path Pattern:" FontSize="12" Foreground="$($Colors.Subtext1)" Margin="0,0,0,4"/>
+                        <ComboBox x:Name="cmbSavedPattern" Style="{StaticResource ComboStyle}" Margin="0,0,0,4"/>
+                        <TextBox x:Name="txtSelectionPattern" Background="$($Colors.Surface0)"
+                                 Foreground="$($Colors.Text)" BorderBrush="$($Colors.Surface1)"
+                                 Padding="6,4" FontSize="12" Margin="0,0,0,4"
+                                 ToolTip="Regex pattern to select matching paths, for example C:\\Downloads\\"/>
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="btnSavePattern" Grid.Column="0" Content="Save Pattern" Style="{StaticResource BtnStyle}"
+                                    HorizontalAlignment="Stretch" Margin="0,0,2,0" Padding="6,4" FontSize="11"/>
+                            <Button x:Name="btnApplyPattern" Grid.Column="1" Content="Apply Pattern" Style="{StaticResource BtnStyle}"
+                                    HorizontalAlignment="Stretch" Margin="2,0,0,0" Padding="6,4" FontSize="11"/>
+                        </Grid>
                         <Button x:Name="btnAutoSelect" Content="Apply Auto-Select" Style="{StaticResource BtnStyle}"
                                 HorizontalAlignment="Stretch" Margin="0,0,0,4"/>
                         <Button x:Name="btnSelectAll" Content="Select All Duplicates" Style="{StaticResource BtnStyle}"
@@ -739,7 +1105,15 @@ if ($script:HighContrast) {
                         <Button x:Name="btnDeleteSelected" Content="Delete Selected" Style="{StaticResource DangerBtn}"
                                 HorizontalAlignment="Stretch" Margin="0,0,0,4"
                                 AutomationProperties.Name="Delete selected duplicate files"/>
-                        <Button x:Name="btnExport" Content="Export Results (CSV)" Style="{StaticResource BtnStyle}"
+                        <Button x:Name="btnUndoDelete" Content="Undo Last Recycle Delete" Style="{StaticResource BtnStyle}"
+                                HorizontalAlignment="Stretch" Margin="0,0,0,8" IsEnabled="False"/>
+                        <TextBlock Text="Export:" FontSize="12" Foreground="$($Colors.Subtext1)" Margin="0,0,0,4"/>
+                        <ComboBox x:Name="cmbExportFormat" Style="{StaticResource ComboStyle}" Margin="0,0,0,4">
+                            <ComboBoxItem Content="CSV" IsSelected="True"/>
+                            <ComboBoxItem Content="HTML"/>
+                            <ComboBoxItem Content="Markdown"/>
+                        </ComboBox>
+                        <Button x:Name="btnExport" Content="Export Results" Style="{StaticResource BtnStyle}"
                                 HorizontalAlignment="Stretch" Margin="0,0,0,0"/>
                     </StackPanel>
                 </Border>
@@ -775,10 +1149,12 @@ $window = [System.Windows.Markup.XamlReader]::Load($reader)
 # --- Get Controls ---
 $controls = @{}
 @('lstFolders','btnAddFolder','btnAddRef','btnRemoveFolder','cmbMinSize','cmbMaxSize','cmbFilter',
-  'chkSubfolders','chkZeroByte','btnScan','btnCancel','dgResults','imgPreview',
-  'txtPreviewName','txtPreviewInfo','cmbAutoSelect','btnAutoSelect','btnSelectAll',
+  'chkSubfolders','chkZeroByte','txtKnownHashes','cmbWorkers','chkNeverDeleteNetwork',
+  'btnScan','btnCancel','dgResults','tvGroups','imgPreview',
+  'txtPreviewName','txtPreviewInfo','cmbAutoSelect','txtRuleChain','cmbSavedPattern',
+  'txtSelectionPattern','btnSavePattern','btnApplyPattern','btnAutoSelect','btnSelectAll',
   'btnDeselectAll','btnInvertSel','cmbDeleteMode','btnRehearse','btnDeleteSelected','btnExport',
-  'txtStatus','txtStats','prgScan',
+  'btnUndoDelete','cmbExportFormat','txtStatus','txtStats','prgScan',
   'ctxOpenFile','ctxOpenFolder','ctxCopyPath','ctxCopyHash','ctxSelectGroup','ctxDeselectGroup','ctxSelectFolder',
   'txtFilter','btnClearFilter','txtFilterCount') | ForEach-Object {
     $controls[$_] = $window.FindName($_)
@@ -789,8 +1165,74 @@ $script:ScanFolders = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:Results = [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]]::new()
 $script:CancelSource = $null
 $script:IsScanning = $false
+$script:UndoStack = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:SettingsDir = [System.IO.Path]::Combine([Environment]::GetFolderPath('ApplicationData'), 'DuplicateFF')
+$script:SettingsPath = [System.IO.Path]::Combine($script:SettingsDir, 'settings.json')
 
 $controls.dgResults.ItemsSource = $script:Results
+
+function Load-DuplicateFFSettings {
+    if (-not [System.IO.File]::Exists($script:SettingsPath)) { return }
+    try {
+        $settings = Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json
+        if ($settings.SelectionPatterns) {
+            $controls.cmbSavedPattern.Items.Clear()
+            foreach ($pattern in $settings.SelectionPatterns) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$pattern)) {
+                    $controls.cmbSavedPattern.Items.Add([string]$pattern) | Out-Null
+                }
+            }
+        }
+    } catch { }
+}
+
+function Save-DuplicateFFSettings {
+    try {
+        if (-not [System.IO.Directory]::Exists($script:SettingsDir)) {
+            [System.IO.Directory]::CreateDirectory($script:SettingsDir) | Out-Null
+        }
+        $patterns = @()
+        foreach ($item in $controls.cmbSavedPattern.Items) { $patterns += [string]$item }
+        @{ SelectionPatterns = $patterns } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+    } catch { }
+}
+
+function Refresh-GroupTree {
+    $controls.tvGroups.Items.Clear()
+    $groups = @{}
+    foreach ($r in $script:Results) {
+        if (-not $groups.ContainsKey($r.Group)) {
+            $groups[$r.Group] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $groups[$r.Group].Add($r)
+    }
+    foreach ($groupId in ($groups.Keys | Sort-Object {[int]$_})) {
+        $items = $groups[$groupId]
+        $first = $items[0]
+        $header = "Group $groupId - $($first.GroupInfo)"
+        $node = [System.Windows.Controls.TreeViewItem]::new()
+        $node.Header = $header
+        $node.Tag = $groupId
+        foreach ($item in ($items | Sort-Object Status, FileName)) {
+            $child = [System.Windows.Controls.TreeViewItem]::new()
+            $child.Header = "$($item.Status): $($item.FileName)"
+            $child.Tag = $item.FullPath
+            $node.Items.Add($child) | Out-Null
+        }
+        $controls.tvGroups.Items.Add($node) | Out-Null
+    }
+}
+
+function Get-SelectedPatternList {
+    $patterns = [System.Collections.Generic.List[string]]::new()
+    $typed = $controls.txtSelectionPattern.Text
+    if (-not [string]::IsNullOrWhiteSpace($typed)) { $patterns.Add($typed) }
+    $saved = $controls.cmbSavedPattern.SelectedItem
+    if ($saved -and $patterns -notcontains [string]$saved) { $patterns.Add([string]$saved) }
+    return @($patterns)
+}
+
+Load-DuplicateFFSettings
 
 # --- Add Folder ---
 $controls.btnAddFolder.Add_Click({
@@ -974,6 +1416,48 @@ $controls.ctxSelectFolder.Add_Click({
     }
 })
 
+$controls.tvGroups.Add_SelectedItemChanged({
+    $node = $controls.tvGroups.SelectedItem
+    if ($null -eq $node) { return }
+    if ($node.Tag -is [int] -or "$($node.Tag)" -match '^\d+$') {
+        $target = $script:Results | Where-Object { $_.Group -eq [int]$node.Tag } | Select-Object -First 1
+    } else {
+        $target = $script:Results | Where-Object { $_.FullPath -eq [string]$node.Tag } | Select-Object -First 1
+    }
+    if ($target) {
+        $controls.dgResults.SelectedItem = $target
+        $controls.dgResults.ScrollIntoView($target)
+    }
+})
+
+$controls.btnSavePattern.Add_Click({
+    $pattern = $controls.txtSelectionPattern.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($pattern)) {
+        $controls.txtStatus.Text = "Enter a path regex pattern to save"
+        return
+    }
+    $exists = $false
+    foreach ($item in $controls.cmbSavedPattern.Items) {
+        if ([string]$item -eq $pattern) { $exists = $true; break }
+    }
+    if (-not $exists) { $controls.cmbSavedPattern.Items.Add($pattern) | Out-Null }
+    $controls.cmbSavedPattern.SelectedItem = $pattern
+    Save-DuplicateFFSettings
+    $controls.txtStatus.Text = "Saved selection pattern"
+})
+
+$controls.btnApplyPattern.Add_Click({
+    $patterns = Get-SelectedPatternList
+    if ($patterns.Count -eq 0) {
+        $controls.txtStatus.Text = "Enter or choose a selection pattern"
+        return
+    }
+    Select-DuplicateResults $script:Results $null $null $patterns
+    $controls.dgResults.Items.Refresh()
+    $selectedCount = ($script:Results | Where-Object { $_.Selected }).Count
+    $controls.txtStatus.Text = "$selectedCount files selected by pattern"
+})
+
 # --- Filter Results ---
 $script:AllResults = $null
 $controls.txtFilter.Add_TextChanged({
@@ -1032,6 +1516,9 @@ $controls.btnScan.Add_Click({
     $minSizeLabel = ($controls.cmbMinSize.SelectedItem).Content
     $maxSizeLabel = ($controls.cmbMaxSize.SelectedItem).Content
     $filterLabel = ($controls.cmbFilter.SelectedItem).Content
+    $workerLabel = ($controls.cmbWorkers.SelectedItem).Content
+    $workerCount = if ($workerLabel -eq 'Auto') { Get-DefaultWorkerCount 0 } else { Get-DefaultWorkerCount ([int]$workerLabel) }
+    $knownHashSet = Get-KnownHashSet -HashValues @($controls.txtKnownHashes.Text) -HashPath $null
 
     # Shared sync hashtable for progress reporting
     $sync = [hashtable]::Synchronized(@{
@@ -1039,12 +1526,19 @@ $controls.btnScan.Add_Click({
         Phase = "enum"
         TotalFiles = 0
         ProcessedFiles = 0
+        ProcessedBytes = 0L
+        TotalBytes = 0L
+        StageTotalBytes = 0L
+        StageProcessedBytes = 0L
+        StartUtc = [DateTime]::UtcNow
+        WorkerCount = $workerCount
         DuplicateGroups = 0
         DuplicateFiles = 0
         WastedSpace = 0L
         Results = [System.Collections.ArrayList]::new()
         Errors = [System.Collections.ArrayList]::new()
         HardlinkExcluded = 0
+        KnownHashExcluded = 0
         Done = $false
         Error = $null
     })
@@ -1053,7 +1547,7 @@ $controls.btnScan.Add_Click({
     $ps = [PowerShell]::Create()
     $ps.AddScript({
         param($folders, $recurse, $skipZero, $minSizeLabel, $maxSizeLabel, $filterLabel, $token, $sync,
-              $imageExts, $videoExts, $audioExts, $docExts, $excludePatterns)
+              $imageExts, $videoExts, $audioExts, $docExts, $excludePatterns, $knownHashes, $workerCount)
 
         function Get-MinSizeBytes([string]$label) {
             switch ($label) {
@@ -1117,6 +1611,17 @@ $controls.btnScan.Add_Click({
                 try {
                     $sha = [System.Security.Cryptography.SHA256]::Create()
                     try {
+                        if ($fs.Length -ge 134217728) {
+                            $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile(
+                                $fs, $null, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read,
+                                [System.IO.HandleInheritability]::None, $true)
+                            try {
+                                $view = $mmf.CreateViewStream(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+                                try {
+                                    return [BitConverter]::ToString($sha.ComputeHash($view)).Replace('-','')
+                                } finally { $view.Dispose() }
+                            } finally { $mmf.Dispose() }
+                        }
                         $bufSize = 262144
                         $buf = [byte[]]::new($bufSize)
                         while ($true) {
