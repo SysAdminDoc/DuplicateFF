@@ -82,6 +82,8 @@ public class Win32 {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
 }
@@ -207,16 +209,31 @@ function Remove-ToRecycleBin([string]$path) {
     )
 }
 
-function Get-NtfsFileId([string]$path) {
+function Get-NtfsFileInfo([string]$path) {
     try {
         $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
         try {
             $info = [BY_HANDLE_FILE_INFORMATION]::new()
             if ([Win32]::GetFileInformationByHandle($fs.SafeFileHandle.DangerousGetHandle(), [ref]$info)) {
-                return "$($info.VolumeSerialNumber):$($info.FileIndexHigh):$($info.FileIndexLow)"
+                return [PSCustomObject]@{
+                    Id = "$($info.VolumeSerialNumber):$($info.FileIndexHigh):$($info.FileIndexLow)"
+                    NumberOfLinks = [int]$info.NumberOfLinks
+                }
             }
         } finally { $fs.Dispose() }
     } catch { }
+    return $null
+}
+
+function Get-NtfsFileId([string]$path) {
+    $info = Get-NtfsFileInfo $path
+    if ($info) { return $info.Id }
+    return $null
+}
+
+function Get-NtfsHardlinkCount([string]$path) {
+    $info = Get-NtfsFileInfo $path
+    if ($info) { return $info.NumberOfLinks }
     return $null
 }
 
@@ -255,27 +272,38 @@ function Get-DefaultWorkerCount([int]$requested = 0) {
 
 function Get-KnownHashSet([string[]]$HashValues, [string]$HashPath) {
     $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $tokens = [System.Collections.Generic.List[string]]::new()
+    $texts = [System.Collections.Generic.List[string]]::new()
     if ($HashValues) {
         foreach ($value in $HashValues) {
             if ([string]::IsNullOrWhiteSpace($value)) { continue }
-            foreach ($part in ($value -split '[\s,;]+')) {
-                if (-not [string]::IsNullOrWhiteSpace($part)) { $tokens.Add($part) }
-            }
+            $texts.Add($value)
         }
     }
     if ($HashPath -and [System.IO.File]::Exists($HashPath)) {
         foreach ($line in [System.IO.File]::ReadAllLines($HashPath)) {
-            foreach ($part in ($line -split '[\s,;]+')) {
-                if (-not [string]::IsNullOrWhiteSpace($part)) { $tokens.Add($part) }
-            }
+            $texts.Add($line)
         }
     }
-    foreach ($token in $tokens) {
-        $clean = ($token.Trim() -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
-        if ($clean.Length -ge 32) { $set.Add($clean) | Out-Null }
+    foreach ($text in $texts) {
+        foreach ($match in [System.Text.RegularExpressions.Regex]::Matches($text, '(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])')) {
+            $set.Add($match.Value.ToUpperInvariant()) | Out-Null
+        }
     }
-    return $set
+    return ,$set
+}
+
+function Test-SelectionPattern([string]$path, [string]$pattern) {
+    if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($pattern)) { return $false }
+    $candidate = $path
+    $expression = $pattern.Trim()
+    if ($expression.Contains('*') -or $expression.Contains('?')) {
+        try {
+            if ([System.Management.Automation.WildcardPattern]::new($expression, [System.Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($candidate)) {
+                return $true
+            }
+        } catch { }
+    }
+    try { return $candidate -match $expression } catch { return $false }
 }
 
 function Test-NetworkPath([string]$path) {
@@ -457,7 +485,7 @@ function Select-DuplicateResults([System.Collections.IEnumerable]$Rows, [string]
             foreach ($pattern in $Patterns) {
                 if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
                 try {
-                    if ($r.FullPath -match $pattern) { $r.Selected = $true; break }
+                    if (Test-SelectionPattern $r.FullPath $pattern) { $r.Selected = $true; break }
                 } catch { }
             }
         }
@@ -521,6 +549,8 @@ $script:ImageExts = @('.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp'
 $script:VideoExts = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
 $script:AudioExts = @('.mp3','.flac','.wav','.aac','.ogg','.wma','.m4a','.opus','.aiff','.alac')
 $script:DocExts = @('.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.rtf','.odt','.ods','.csv')
+$script:MaxHardlinksPerFile = 1023
+$script:MaxUndoBatches = 10
 
 # ===================================================================
 # GUI MODE
@@ -1209,14 +1239,19 @@ function Refresh-GroupTree {
     foreach ($groupId in ($groups.Keys | Sort-Object {[int]$_})) {
         $items = $groups[$groupId]
         $first = $items[0]
-        $header = "Group $groupId - $($first.GroupInfo)"
+        $groupTotal = ($items | Measure-Object -Property Size -Sum).Sum
+        $reclaimable = ($items.Count - 1) * $first.Size
+        $header = "Group $groupId - $($items.Count) files | $(Format-FileSize $reclaimable) reclaimable"
         $node = [System.Windows.Controls.TreeViewItem]::new()
         $node.Header = $header
         $node.Tag = $groupId
+        $node.ToolTip = "Total size: $(Format-FileSize $groupTotal) | Reclaimable: $(Format-FileSize $reclaimable)"
+        $node.IsExpanded = $false
         foreach ($item in ($items | Sort-Object Status, FileName)) {
             $child = [System.Windows.Controls.TreeViewItem]::new()
             $child.Header = "$($item.Status): $($item.FileName)"
             $child.Tag = $item.FullPath
+            $child.ToolTip = $item.FullPath
             $node.Items.Add($child) | Out-Null
         }
         $controls.tvGroups.Items.Add($node) | Out-Null
@@ -1521,7 +1556,7 @@ $controls.btnScan.Add_Click({
     $knownHashSet = Get-KnownHashSet -HashValues @($controls.txtKnownHashes.Text) -HashPath $null
 
     # Shared sync hashtable for progress reporting
-    $sync = [hashtable]::Synchronized(@{
+        $sync = [hashtable]::Synchronized(@{
         Status = "Enumerating files..."
         Phase = "enum"
         TotalFiles = 0
@@ -1538,8 +1573,11 @@ $controls.btnScan.Add_Click({
         Results = [System.Collections.ArrayList]::new()
         Errors = [System.Collections.ArrayList]::new()
         HardlinkExcluded = 0
-        KnownHashExcluded = 0
-        Done = $false
+         KnownHashExcluded = 0
+         EarlyAbort = $false
+         Progress = 0.0
+         ETASeconds = $null
+         Done = $false
         Error = $null
     })
 
@@ -1798,7 +1836,13 @@ $controls.btnScan.Add_Click({
             $sizeGroups = $null
 
             $sync.Status = "$($candidates.Count) files in size-matched groups (eliminated $($allFiles.Count - $candidates.Count))"
-            if ($candidates.Count -eq 0) { $sync.Done = $true; return }
+             if ($candidates.Count -eq 0) {
+                 $sync.EarlyAbort = $true
+                 $sync.Progress = 100.0
+                 $sync.Status = "Complete - size grouping eliminated all files; no duplicate candidates"
+                 $sync.Done = $true
+                 return
+             }
 
             # Phase 3: Prefix hash (first 4KB)
             $sync.Phase = "prefix"
@@ -1830,7 +1874,13 @@ $controls.btnScan.Add_Click({
             $prefixGroups = $null
 
             $sync.Status = "$($prefixCandidates.Count) files after prefix hash (eliminated $($candidates.Count - $prefixCandidates.Count) more)"
-            if ($prefixCandidates.Count -eq 0) { $sync.Done = $true; return }
+            if ($prefixCandidates.Count -eq 0) {
+                $sync.EarlyAbort = $true
+                $sync.Progress = 100.0
+                $sync.Status = "Complete - prefix hashing eliminated all candidates"
+                $sync.Done = $true
+                return
+            }
 
             # Phase 4: Suffix hash (last 4KB)
             $sync.Phase = "suffix"
@@ -1861,7 +1911,13 @@ $controls.btnScan.Add_Click({
             $suffixGroups = $null
 
             $sync.Status = "$($suffixCandidates.Count) files after suffix hash"
-            if ($suffixCandidates.Count -eq 0) { $sync.Done = $true; return }
+            if ($suffixCandidates.Count -eq 0) {
+                $sync.EarlyAbort = $true
+                $sync.Progress = 100.0
+                $sync.Status = "Complete - suffix hashing eliminated all candidates"
+                $sync.Done = $true
+                return
+            }
 
             # Phase 5: Full hash (only remaining candidates)
             $sync.Phase = "full"
@@ -1872,6 +1928,10 @@ $controls.btnScan.Add_Click({
                 if ($token.IsCancellationRequested) { return }
                 $hash = Get-FileHashValue $f.FullPath
                 if ($null -eq $hash) { continue }
+                if ($knownHashes -and $knownHashes.Contains($hash)) {
+                    $sync.KnownHashExcluded++
+                    continue
+                }
                 if (-not $fullGroups.ContainsKey($hash)) {
                     $fullGroups[$hash] = [System.Collections.Generic.List[PSCustomObject]]::new()
                 }
@@ -1965,7 +2025,7 @@ $controls.btnScan.Add_Click({
     }).AddArgument($folders).AddArgument($recurse).AddArgument($skipZero).AddArgument($minSizeLabel
     ).AddArgument($maxSizeLabel).AddArgument($filterLabel).AddArgument($token).AddArgument($sync
     ).AddArgument($script:ImageExts).AddArgument($script:VideoExts).AddArgument($script:AudioExts).AddArgument($script:DocExts
-    ).AddArgument($script:DefaultExcludePatterns)
+    ).AddArgument($script:DefaultExcludePatterns).AddArgument($knownHashSet).AddArgument($workerCount)
 
     $handle = $ps.BeginInvoke()
 
@@ -1991,6 +2051,7 @@ $controls.btnScan.Add_Click({
             foreach ($r in $s.Results) {
                 $script:Results.Add($r)
             }
+            Refresh-GroupTree
 
             $controls.prgScan.Visibility = 'Collapsed'
             $controls.prgScan.IsIndeterminate = $false
@@ -2049,54 +2110,8 @@ $controls.btnCancel.Add_Click({
 $controls.btnAutoSelect.Add_Click({
     if ($script:Results.Count -eq 0) { return }
     $mode = ($controls.cmbAutoSelect.SelectedItem).Content
-
-    # Group results
-    $groups = @{}
-    foreach ($r in $script:Results) {
-        if (-not $groups.ContainsKey($r.Group)) {
-            $groups[$r.Group] = [System.Collections.Generic.List[PSCustomObject]]::new()
-        }
-        $groups[$r.Group].Add($r)
-    }
-
-    foreach ($kv in $groups.GetEnumerator()) {
-        $items = $kv.Value
-        # First deselect all, then figure out which to keep
-        foreach ($i in $items) { $i.Selected = $false }
-
-        $keepIdx = 0
-        switch ($mode) {
-            "Keep Newest" {
-                $sorted = $items | Sort-Object ModifiedDt -Descending
-                $keepIdx = $script:Results.IndexOf($sorted[0])
-            }
-            "Keep Oldest" {
-                $sorted = $items | Sort-Object ModifiedDt
-                $keepIdx = $script:Results.IndexOf($sorted[0])
-            }
-            "Keep from Reference Folders" {
-                $refItem = $items | Where-Object { $_.IsRef } | Select-Object -First 1
-                if ($refItem) { $keepIdx = $script:Results.IndexOf($refItem) }
-                else { $keepIdx = $script:Results.IndexOf($items[0]) }
-            }
-            "Keep Largest" {
-                $sorted = $items | Sort-Object Size -Descending
-                $keepIdx = $script:Results.IndexOf($sorted[0])
-            }
-            "Keep Shortest Path" {
-                $sorted = $items | Sort-Object { $_.FullPath.Length }
-                $keepIdx = $script:Results.IndexOf($sorted[0])
-            }
-        }
-
-        # Select all except the keep target
-        foreach ($i in $items) {
-            if ($i.IsRef) { $i.Selected = $false; continue }
-            if ($script:Results.IndexOf($i) -ne $keepIdx) {
-                $i.Selected = $true
-            }
-        }
-    }
+    $ruleChain = if ($mode -eq 'Rule Chain') { $controls.txtRuleChain.Text } else { $null }
+    Select-DuplicateResults $script:Results $($mode -replace 'Keep from Reference Folders','KeepReference' -replace 'Keep ','Keep' -replace 'Rule Chain','RuleChain') $ruleChain (Get-SelectedPatternList)
     $controls.dgResults.Items.Refresh()
     $selectedCount = ($script:Results | Where-Object { $_.Selected }).Count
     $controls.txtStatus.Text = "$selectedCount files selected for deletion"
@@ -2382,6 +2397,17 @@ $window.ShowDialog() | Out-Null
 # ===================================================================
 else {
 
+    if ($PackagePath) {
+        try {
+            $package = New-PortablePackage $PackagePath
+            if (-not $Silent) { Write-Host "Portable package created: $package" }
+            exit 0
+        } catch {
+            Write-Error "Portable package failed: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+
     # Map CLI filter param to internal label
     $filterLabel = switch ($Filter) {
         'Images'    { "Images Only" }
@@ -2396,6 +2422,9 @@ else {
     $minSizeBytes = Get-MinSizeBytes $MinSize
     $maxSizeBytes = Get-MaxSizeBytes $MaxSize
     $cliExcludePatterns = if ($Exclude) { $Exclude } else { $script:DefaultExcludePatterns }
+    $knownHashSet = Get-KnownHashSet -HashValues $KnownHash -HashPath $KnownHashPath
+    $workerCount = Get-DefaultWorkerCount $WorkerCount
+    $knownHashExcluded = 0
 
     # Build folder list
     $refPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -2417,8 +2446,8 @@ else {
         else { Write-Error "Scan folder not found: $sp"; exit 3 }
     }
 
-    if ($Delete -and -not $AutoSelect) {
-        Write-Error "The -Delete parameter requires -AutoSelect to determine which files to keep. Example: -AutoSelect KeepNewest -Delete RecycleBin"
+    if ($Delete -and -not $AutoSelect -and -not $SelectPattern) {
+        Write-Error "The -Delete parameter requires -AutoSelect or -SelectPattern to determine which files to keep/delete. Example: -AutoSelect KeepNewest -Delete RecycleBin"
         exit 1
     }
 
@@ -2550,6 +2579,7 @@ else {
         $uniqueByHash = [System.Collections.Generic.List[PSCustomObject]]::new()
         foreach ($sf in $needHash) {
             $hash = Get-FileHashValue $sf.FullPath
+            if ($hash -and $knownHashSet.Contains($hash)) { continue }
             if ($null -eq $hash -or -not $refHashSet.Contains($hash)) {
                 $uniqueByHash.Add($sf)
             }
@@ -2658,6 +2688,10 @@ else {
     foreach ($f in $suffixCandidates) {
         $hash = Get-FileHashValue $f.FullPath
         if ($null -eq $hash) { continue }
+        if ($knownHashSet.Contains($hash)) {
+            $knownHashExcluded++
+            continue
+        }
         if (-not $fullGroups.ContainsKey($hash)) {
             $fullGroups[$hash] = [System.Collections.Generic.List[PSCustomObject]]::new()
         }
@@ -2768,28 +2802,8 @@ else {
     }
 
     # Apply auto-select if specified
-    if ($AutoSelect) {
-        $groups = @{}
-        foreach ($r in $results) {
-            if (-not $groups.ContainsKey($r.Group)) {
-                $groups[$r.Group] = [System.Collections.Generic.List[PSCustomObject]]::new()
-            }
-            $groups[$r.Group].Add($r)
-        }
-        foreach ($kv in $groups.GetEnumerator()) {
-            $items = $kv.Value
-            $keepItem = switch ($AutoSelect) {
-                'KeepNewest'       { ($items | Sort-Object ModifiedDt -Descending)[0] }
-                'KeepOldest'       { ($items | Sort-Object ModifiedDt)[0] }
-                'KeepReference'    { $ref = $items | Where-Object { $_.IsRef } | Select-Object -First 1; if ($ref) { $ref } else { $items[0] } }
-                'KeepLargest'      { ($items | Sort-Object Size -Descending)[0] }
-                'KeepShortestPath' { ($items | Sort-Object { $_.FullPath.Length })[0] }
-            }
-            foreach ($i in $items) {
-                if ($i.IsRef) { $i.Selected = $false; continue }
-                $i.Selected = ($i -ne $keepItem)
-            }
-        }
+    if ($AutoSelect -or $SelectPattern) {
+        Select-DuplicateResults $results $AutoSelect $AutoSelectChain $SelectPattern
     }
 
     # DryRun mode: just report what would happen
