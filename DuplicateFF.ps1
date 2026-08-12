@@ -1196,6 +1196,7 @@ $script:Results = [System.Collections.ObjectModel.ObservableCollection[PSCustomO
 $script:CancelSource = $null
 $script:IsScanning = $false
 $script:UndoStack = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:UndoInProgress = $false
 $script:SettingsDir = [System.IO.Path]::Combine([Environment]::GetFolderPath('ApplicationData'), 'DuplicateFF')
 $script:SettingsPath = [System.IO.Path]::Combine($script:SettingsDir, 'settings.json')
 
@@ -2228,8 +2229,18 @@ $controls.btnDeleteSelected.Add_Click({
 
     # Build operation list on UI thread (fast), execute I/O on background thread
     $ops = [System.Collections.ArrayList]::new()
+    $selectedGroups = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($item in $selected) { $selectedGroups.Add([int]$item.Group) | Out-Null }
+    $rowsForUndo = if ($script:AllResults) { @($script:AllResults) } else { @($script:Results) }
+    $undoRowsByPath = @{}
+    foreach ($row in $rowsForUndo) {
+        if ($selectedGroups.Contains([int]$row.Group)) {
+            $undoRowsByPath[$row.FullPath] = $row
+        }
+    }
     foreach ($item in $selected) {
         $op = @{ Path = $item.FullPath; Size = $item.Size; Hash = $item.Hash; Group = $item.Group; Mode = $mode; OriginalPath = $null }
+        $undoRowsByPath[$item.FullPath] = $item
         if ($mode -eq "Replace with Hardlinks") {
             $original = $script:Results | Where-Object { $_.Group -eq $item.Group -and -not $_.Selected -and $_.FullPath -ne $item.FullPath } | Select-Object -First 1
             if ($original) { $op.OriginalPath = $original.FullPath }
@@ -2248,6 +2259,7 @@ $controls.btnDeleteSelected.Add_Click({
         Deleted = 0; Errors = 0; SkippedLocked = 0; SkippedCrossVol = 0
         Processed = 0; Total = $ops.Count; TotalSize = $totalSize
         ActionLog = [System.Collections.ArrayList]::new()
+        UndoOperations = [System.Collections.ArrayList]::new()
         LogPath = $null; Done = $false
     })
 
@@ -2272,7 +2284,26 @@ $controls.btnDeleteSelected.Add_Click({
                         [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($op.Path,
                             [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
                             [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
-                        $delSync.ActionLog.Add(@{ Action = "RecycleBin"; Path = $op.Path; Size = $op.Size; Hash = $op.Hash }) | Out-Null
+                        if ([System.IO.File]::Exists($op.Path)) {
+                            throw "Recycle Bin did not remove $($op.Path)"
+                        }
+                        $undoOperation = @{
+                            OriginalPath = $op.Path
+                            DeletedFrom = [System.IO.Path]::GetDirectoryName($op.Path)
+                            FileName = [System.IO.Path]::GetFileName($op.Path)
+                            Size = $op.Size
+                            Hash = $op.Hash
+                            Group = $op.Group
+                        }
+                        $delSync.UndoOperations.Add($undoOperation) | Out-Null
+                        $delSync.ActionLog.Add(@{
+                            Action = "RecycleBin"
+                            Path = $op.Path
+                            OriginalPath = $op.Path
+                            DeletedFrom = $undoOperation.DeletedFrom
+                            Size = $op.Size
+                            Hash = $op.Hash
+                        }) | Out-Null
                     }
                     "Permanent Delete" {
                         [System.IO.File]::Delete($op.Path)
@@ -2326,7 +2357,7 @@ $controls.btnDeleteSelected.Add_Click({
 
     $delTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $delTimer.Interval = [TimeSpan]::FromMilliseconds(100)
-    $delTimer.Tag = @{ PS = $delPs; Handle = $delHandle; Sync = $delSync }
+    $delTimer.Tag = @{ PS = $delPs; Handle = $delHandle; Sync = $delSync; UndoRowsByPath = $undoRowsByPath }
     $delTimer.Add_Tick({
         $ctx = $this.Tag
         $ds = $ctx.Sync
@@ -2338,7 +2369,24 @@ $controls.btnDeleteSelected.Add_Click({
             $ctx.PS.Dispose()
 
             $toRemove = @($script:Results | Where-Object { $_.Selected -and -not [System.IO.File]::Exists($_.FullPath) })
-            foreach ($r in $toRemove) { $script:Results.Remove($r) | Out-Null }
+            foreach ($r in $toRemove) {
+                $script:Results.Remove($r) | Out-Null
+                if ($script:AllResults -and $script:AllResults.Contains($r)) {
+                    $script:AllResults.Remove($r)
+                }
+            }
+            if ($ds.UndoOperations.Count -gt 0) {
+                $undoRows = @($ctx.UndoRowsByPath.GetEnumerator() | ForEach-Object { $_.Value })
+                $script:UndoStack.Add([PSCustomObject]@{
+                    Operations = @($ds.UndoOperations)
+                    Rows = $undoRows
+                    CreatedUtc = [DateTime]::UtcNow
+                })
+                while ($script:UndoStack.Count -gt $script:MaxUndoBatches) {
+                    $script:UndoStack.RemoveAt(0)
+                }
+                $controls.btnUndoDelete.IsEnabled = $true
+            }
             $groupCounts = @{}
             foreach ($r in $script:Results) {
                 if (-not $groupCounts.ContainsKey($r.Group)) { $groupCounts[$r.Group] = 0 }
@@ -2346,6 +2394,7 @@ $controls.btnDeleteSelected.Add_Click({
             }
             $singles = @($script:Results | Where-Object { $groupCounts[$_.Group] -lt 2 })
             foreach ($s in $singles) { $script:Results.Remove($s) | Out-Null }
+            Refresh-GroupTree
 
             $controls.prgScan.Visibility = 'Collapsed'
             $controls.btnDeleteSelected.IsEnabled = $true
@@ -2359,6 +2408,166 @@ $controls.btnDeleteSelected.Add_Click({
         }
     })
     $delTimer.Start()
+})
+
+# --- Undo Last Recycle Delete ---
+$controls.btnUndoDelete.Add_Click({
+    if ($script:UndoInProgress -or $script:UndoStack.Count -eq 0) {
+        return
+    }
+
+    $batchIndex = $script:UndoStack.Count - 1
+    $batch = $script:UndoStack[$batchIndex]
+    $script:UndoInProgress = $true
+    $controls.btnUndoDelete.IsEnabled = $false
+    $controls.prgScan.Visibility = 'Visible'
+    $controls.prgScan.IsIndeterminate = $false
+    $controls.prgScan.Maximum = $batch.Operations.Count
+    $controls.prgScan.Value = 0
+    $controls.txtStatus.Text = "Restoring 0/$($batch.Operations.Count)..."
+
+    $restoreSync = [hashtable]::Synchronized(@{
+        Restored = 0
+        SkippedExisting = 0
+        Errors = 0
+        Processed = 0
+        Total = $batch.Operations.Count
+        RestoredOperations = [System.Collections.ArrayList]::new()
+        FailedOperations = [System.Collections.ArrayList]::new()
+        ErrorMessages = [System.Collections.ArrayList]::new()
+        Done = $false
+    })
+
+    $restorePs = [PowerShell]::Create()
+    $restorePs.AddScript({
+        param($operations, $sync)
+        try {
+            foreach ($op in $operations) {
+                try {
+                    if ([System.IO.File]::Exists($op.OriginalPath)) {
+                        $sync.SkippedExisting++
+                        $sync.RestoredOperations.Add($op) | Out-Null
+                        $sync.Processed++
+                        continue
+                    }
+
+                    $shell = New-Object -ComObject Shell.Application
+                    $recycleBin = $shell.Namespace(10)
+                    $expectedDirectory = ([System.IO.Path]::GetFullPath([string]$op.DeletedFrom)).TrimEnd('\')
+                    $target = $null
+                    foreach ($candidate in $recycleBin.Items()) {
+                        $deletedFrom = ([string]$candidate.ExtendedProperty('System.Recycle.DeletedFrom')).TrimEnd('\')
+                        if ([string]::Equals($deletedFrom, $expectedDirectory, [System.StringComparison]::OrdinalIgnoreCase) -and
+                            [string]::Equals([string]$candidate.Name, [string]$op.FileName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $target = $candidate
+                            break
+                        }
+                    }
+                    if ($null -eq $target) {
+                        throw "Recycle Bin entry not found for $($op.OriginalPath)"
+                    }
+
+                    $restoreVerb = $target.Verbs() | Where-Object { $_.Name -match 'estore' } | Select-Object -First 1
+                    if ($null -eq $restoreVerb) {
+                        throw "Recycle Bin restore verb unavailable for $($op.OriginalPath)"
+                    }
+                    $restoreVerb.DoIt()
+                    $restored = $false
+                    for ($wait = 0; $wait -lt 20; $wait++) {
+                        Start-Sleep -Milliseconds 100
+                        if ([System.IO.File]::Exists($op.OriginalPath)) {
+                            $restored = $true
+                            break
+                        }
+                    }
+                    if (-not $restored) {
+                        throw "Restore did not recreate $($op.OriginalPath)"
+                    }
+                    $sync.Restored++
+                    $sync.RestoredOperations.Add($op) | Out-Null
+                } catch {
+                    $sync.Errors++
+                    $sync.FailedOperations.Add($op) | Out-Null
+                    $sync.ErrorMessages.Add($_.Exception.Message) | Out-Null
+                }
+                $sync.Processed++
+            }
+        } catch {
+            $sync.Errors++
+            $sync.ErrorMessages.Add($_.Exception.Message) | Out-Null
+        } finally {
+            $sync.Done = $true
+        }
+    }).AddArgument(@($batch.Operations)).AddArgument($restoreSync)
+
+    $restoreHandle = $restorePs.BeginInvoke()
+    $restoreTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $restoreTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+    $restoreTimer.Tag = @{ PS = $restorePs; Handle = $restoreHandle; Sync = $restoreSync; Batch = $batch; BatchIndex = $batchIndex }
+    $restoreTimer.Add_Tick({
+        $ctx = $this.Tag
+        $rs = $ctx.Sync
+        $controls.prgScan.Value = $rs.Processed
+        $controls.txtStatus.Text = "Restoring $($rs.Processed)/$($rs.Total)..."
+        if (-not $rs.Done) { return }
+
+        $this.Stop()
+        $ctx.PS.EndInvoke($ctx.Handle)
+        $ctx.PS.Dispose()
+        $script:UndoStack.RemoveAt($ctx.BatchIndex)
+
+        $restoredPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($op in $rs.RestoredOperations) {
+            $restoredPaths.Add([string]$op.OriginalPath) | Out-Null
+        }
+        foreach ($row in $ctx.Batch.Rows) {
+            if ($restoredPaths.Contains([string]$row.FullPath) -or [System.IO.File]::Exists($row.FullPath)) {
+                $row.Selected = $false
+                $alreadyPresent = $false
+                foreach ($existing in $script:Results) {
+                    if ([string]::Equals([string]$existing.FullPath, [string]$row.FullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $alreadyPresent = $true
+                        break
+                    }
+                }
+                if (-not $alreadyPresent) {
+                    if ($script:AllResults) {
+                        if (-not $script:AllResults.Contains($row)) { $script:AllResults.Add($row) }
+                        $filterText = $controls.txtFilter.Text.Trim()
+                        if ([string]::IsNullOrEmpty($filterText) -or
+                            $row.FileName.IndexOf($filterText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                            $row.FolderPath.IndexOf($filterText, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $script:Results.Add($row)
+                        }
+                    } else {
+                        $script:Results.Add($row)
+                    }
+                }
+            }
+        }
+
+        if ($rs.FailedOperations.Count -gt 0) {
+            $remainingRows = @($ctx.Batch.Rows | Where-Object {
+                $path = $_.FullPath
+                $rs.FailedOperations | Where-Object { $_.OriginalPath -eq $path }
+            })
+            $script:UndoStack.Add([PSCustomObject]@{
+                Operations = @($rs.FailedOperations)
+                Rows = $remainingRows
+                CreatedUtc = $ctx.Batch.CreatedUtc
+            })
+        }
+
+        $script:UndoInProgress = $false
+        $controls.prgScan.Visibility = 'Collapsed'
+        $controls.btnUndoDelete.IsEnabled = $script:UndoStack.Count -gt 0
+        Refresh-GroupTree
+        $statusParts = @("$($rs.Restored) files restored")
+        if ($rs.SkippedExisting -gt 0) { $statusParts += "$($rs.SkippedExisting) already present" }
+        if ($rs.Errors -gt 0) { $statusParts += "$($rs.Errors) restore errors" }
+        $controls.txtStatus.Text = $statusParts -join ' | '
+    })
+    $restoreTimer.Start()
 })
 
 # --- Export CSV ---

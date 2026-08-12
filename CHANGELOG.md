@@ -8,6 +8,7 @@ All notable changes to DuplicateFF will be documented in this file.
 - Added: Shared ranked auto-selection rule chains and saved wildcard/regex path patterns in GUI and CLI.
 - Added: Known-good SHA256 hash exclusions through GUI input and `-KnownHash`/`-KnownHashPath`.
 - Added: `-PackagePath` portable ZIP creation containing the script, README, LICENSE, and screenshot.
+- Added: GUI undo stack for the last ten Recycle Bin delete batches, with asynchronous restore and retry for failures.
 
 ## [v1.1.0] - 2026-06-20
 
