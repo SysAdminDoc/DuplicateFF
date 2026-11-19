@@ -28,7 +28,6 @@ param(
     [switch]$InstallSchedule,
     [string]$ScheduleName = 'DuplicateFF Scheduled Scan',
     [string]$ScheduleInbox,
-    [string]$FileSortPath,
     [string]$MinSize = 'No Minimum',
     [string]$MaxSize = 'No Maximum',
     [string[]]$Exclude,

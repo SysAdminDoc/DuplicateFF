@@ -4,6 +4,7 @@ All notable changes to DuplicateFF will be documented in this file.
 
 ## [Unreleased]
 
+- Removed: An organizer path parameter that nothing read.
 - Added: Expandable duplicate-group browser with per-group file counts and reclaimable totals.
 - Added: Shared ranked auto-selection rule chains and saved wildcard/regex path patterns in GUI and CLI.
 - Added: Known-good SHA256 hash exclusions through GUI input and `-KnownHash`/`-KnownHashPath`.
@@ -82,7 +83,7 @@ PowerShell WPF duplicate file finder with a 6-stage progressive hashing pipeline
 - Report export: HTML (self-contained) with thumbnails for images, markdown for docs
 - Schedule scans as a Windows Task with a drop-your-result-here inbox for IT teams
 - Deduplicate across a mapped network drive and a local copy with explicit "never delete network" guard
-- Integration with FileSort: after a dedupe pass, trigger an organize pass on the cleaned tree
+- Integration with a file organizer: after a dedupe pass, trigger an organize pass on the cleaned tree
 ```
 
 </details>
